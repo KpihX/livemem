@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## [0.3.1] — 2026-03-19
+
+### Added
+- [x] `LiveMem.ingest_awake_batch / ingest_awake_batch_async`: typed batch-ingest path reusing the same awake semantics as single-item ingest
+- [x] `POST /ingest/batch` and `livemem ingest-batch`: public batch-ingest surfaces for API and CLI workflows
+- [x] `compression_stats` in `status()` / `/status`: cumulative runs, fused clusters, removed nodes, created nodes, saved nodes, last run timestamp
+
+### Fixed
+- [x] `retrieve()` is now protected by the engine-level `RLock`, so reinforcement/tier updates cannot race with ingest or sleep outside the API wrapper
+- [x] JSON persistence now round-trips compression stats alongside nodes, edges, and `last_sleep_end`
+
 ## [0.3.0] — 2026-03-19
 
 ### Added

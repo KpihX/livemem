@@ -41,7 +41,7 @@ from livemem.index import TieredIndex
 from livemem.memory import LiveMem
 from livemem.types import Edge, EdgeType, Node, Tier
 
-_FORMAT_VERSION = "0.1.0"
+_FORMAT_VERSION = "0.3.0"
 
 
 def _node_to_dict(node: Node) -> dict:
@@ -148,6 +148,7 @@ def save(mem: LiveMem, path: Path | str) -> None:
         "version": _FORMAT_VERSION,
         "saved_at": time.time(),
         "last_sleep_end": mem.last_sleep_end,
+        "compression_stats": dict(mem.status()["compression_stats"]),
         "nodes": nodes_list,
         "edges": edges_list,
     }
@@ -195,6 +196,17 @@ def load(
     # Build empty LiveMem with the provided config.
     mem = LiveMem(cfg=cfg, embedder=embedder, mock=mock)
     mem.last_sleep_end = float(payload.get("last_sleep_end", 0.0))
+    compression_stats = payload.get("compression_stats", {})
+    mem._compression_stats.update(  # type: ignore[attr-defined]
+        {
+            "runs": int(compression_stats.get("runs", 0)),
+            "clusters_fused": int(compression_stats.get("clusters_fused", 0)),
+            "nodes_removed": int(compression_stats.get("nodes_removed", 0)),
+            "nodes_created": int(compression_stats.get("nodes_created", 0)),
+            "nodes_saved": int(compression_stats.get("nodes_saved", 0)),
+            "last_run_at": float(compression_stats.get("last_run_at", 0.0)),
+        }
+    )
 
     # Restore nodes.
     for nd in payload["nodes"]:

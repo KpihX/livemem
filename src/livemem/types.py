@@ -87,6 +87,29 @@ class RefType:
 # ── Core dataclasses ───────────────────────────────────────────────────────────
 
 @dataclass
+class IngestInput:
+    """Typed input payload for one awake-ingest operation.
+
+    WHY a dedicated dataclass:
+        The engine now supports both single-item ingest and batch ingest.
+        Using a shared typed payload keeps the write-path contract explicit
+        across the Python API, REST layer, CLI helpers, and future adapters.
+    """
+
+    summary: str
+    ref_uri: str | None = None
+    ref_type: str = RefType.TEXT
+    importance: float = 0.5
+    urgency: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "importance", max(0.0, min(1.0, self.importance)))
+        object.__setattr__(self, "urgency", max(0.0, min(1.0, self.urgency)))
+        if self.ref_type not in RefType.ALL:
+            object.__setattr__(self, "ref_type", RefType.TEXT)
+
+
+@dataclass
 class Node:
     """A single memory unit in the graph.
 

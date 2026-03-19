@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from livemem.config import DEFAULT_CONFIG, LiveConfig
 from livemem.memory import LiveMem
 from livemem.persistence import load, save
-from livemem.types import RetrievalResult
+from livemem.types import IngestInput, RetrievalResult
 
 
 class IngestRequest(BaseModel):
@@ -44,6 +44,18 @@ class IngestResponse(BaseModel):
     importance: float
     urgency: float
     tier: str
+
+
+class BatchIngestRequest(BaseModel):
+    """Request payload for batch awake ingestion."""
+
+    items: list[IngestRequest] = Field(..., min_length=1)
+
+
+class BatchIngestResponse(BaseModel):
+    """Response payload after batch ingestion."""
+
+    items: list[IngestResponse]
 
 
 class RetrieveRequest(BaseModel):
@@ -102,6 +114,7 @@ class StatusResponse(BaseModel):
     total_edges: int
     tier_counts: dict[str, int]
     index_sizes: dict[str, int]
+    compression_stats: dict[str, float | int]
     last_sleep_end: float
 
 
@@ -168,6 +181,36 @@ class LiveMemApiState:
                 tier=node.tier.name,
             )
 
+    async def ingest_batch(self, payload: BatchIngestRequest) -> BatchIngestResponse:
+        async with self._op_lock:
+            inputs = [
+                IngestInput(
+                    summary=item.summary,
+                    ref_uri=item.ref_uri,
+                    ref_type=item.ref_type,
+                    importance=item.importance,
+                    urgency=item.urgency,
+                )
+                for item in payload.items
+            ]
+            node_ids = await self.mem.ingest_awake_batch_async(inputs)
+            await self._persist()
+            responses: list[IngestResponse] = []
+            for node_id in node_ids:
+                node = self.mem.graph.V[node_id]
+                responses.append(
+                    IngestResponse(
+                        node_id=node.id,
+                        summary=node.summary,
+                        ref_uri=node.ref_uri,
+                        ref_type=node.ref_type,
+                        importance=node.importance,
+                        urgency=node.urgency,
+                        tier=node.tier.name,
+                    )
+                )
+            return BatchIngestResponse(items=responses)
+
     async def retrieve(self, payload: RetrieveRequest) -> RetrieveResponse:
         async with self._op_lock:
             results = await self.mem.retrieve_async(payload.query, payload.k)
@@ -221,7 +264,7 @@ def create_app(
 
     app = FastAPI(
         title="LiveMem API",
-        version="0.2.0",
+        version="0.3.1",
         summary="Brain-inspired tiered graph memory microservice.",
         lifespan=lifespan,
     )
@@ -240,6 +283,10 @@ def create_app(
     @app.post("/ingest", response_model=IngestResponse)
     async def ingest(payload: IngestRequest) -> IngestResponse:
         return await api_state().ingest(payload)
+
+    @app.post("/ingest/batch", response_model=BatchIngestResponse)
+    async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
+        return await api_state().ingest_batch(payload)
 
     @app.post("/retrieve", response_model=RetrieveResponse)
     async def retrieve(payload: RetrieveRequest) -> RetrieveResponse:

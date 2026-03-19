@@ -9,6 +9,7 @@ WHY a CLI:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -24,7 +25,7 @@ from livemem.config import DEFAULT_CONFIG, LiveConfig
 from livemem.embedder import make_embedder
 from livemem.memory import LiveMem
 from livemem.persistence import load, save
-from livemem.types import RefType, Tier
+from livemem.types import IngestInput, RefType, Tier
 
 app = typer.Typer(
     name="livemem",
@@ -136,6 +137,63 @@ def ingest(
 
 
 @app.command()
+def ingest_batch(
+    file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="JSON file containing a list of ingest items."),
+    mock: bool = typer.Option(False, "--mock", help="Use mock embedder (no model download)."),
+) -> None:
+    """Ingest multiple memory units from a JSON file."""
+    try:
+        payload = json.loads(file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid JSON file: {exc}") from exc
+
+    if not isinstance(payload, list):
+        raise typer.BadParameter("Batch file must contain a JSON array of ingest objects.")
+
+    items: list[IngestInput] = []
+    for idx, raw in enumerate(payload, start=1):
+        if not isinstance(raw, dict):
+            raise typer.BadParameter(f"Item #{idx} must be a JSON object.")
+        summary = raw.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise typer.BadParameter(f"Item #{idx} must contain a non-empty 'summary' string.")
+        items.append(
+            IngestInput(
+                summary=summary,
+                ref_uri=raw.get("ref_uri"),
+                ref_type=str(raw.get("ref_type", RefType.TEXT)),
+                importance=float(raw.get("importance", 0.5)),
+                urgency=float(raw.get("urgency", 0.0)),
+            )
+        )
+
+    mem = _load_or_new(mock)
+    node_ids = mem.ingest_awake_batch(items)
+    _save_state(mem)
+
+    table = Table(title=f"Batch Ingest: {len(node_ids)} items", show_lines=True)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("UUID", width=36)
+    table.add_column("Tier", width=8)
+    table.add_column("Imp", width=14)
+    table.add_column("Urg", width=14)
+    table.add_column("Summary", min_width=30, max_width=60)
+
+    for idx, node_id in enumerate(node_ids, start=1):
+        node = mem.graph.V[node_id]
+        table.add_row(
+            str(idx),
+            node_id,
+            _tier_name(node.tier),
+            _importance_label(node.importance, mem.cfg),
+            _urgency_label(node.urgency, mem.cfg),
+            node.summary[:60],
+        )
+
+    console.print(table)
+
+
+@app.command()
 def retrieve(
     query: str = typer.Argument(..., help="Query text."),
     k: int = typer.Option(10, "--k", help="Number of results to return."),
@@ -226,6 +284,10 @@ def status(
     table.add_row("SHORT index", str(s["index_sizes"]["SHORT"]))
     table.add_row("MEDIUM index", str(s["index_sizes"]["MEDIUM"]))
     table.add_row("LONG index", str(s["index_sizes"]["LONG"]))
+    table.add_row("Compression runs", str(s["compression_stats"]["runs"]))
+    table.add_row("Clusters fused", str(s["compression_stats"]["clusters_fused"]))
+    table.add_row("Nodes saved", str(s["compression_stats"]["nodes_saved"]))
+    table.add_row("Last compression", str(s["compression_stats"]["last_run_at"]))
     table.add_row("Last sleep", str(s["last_sleep_end"]))
 
     console.print(table)

@@ -31,6 +31,7 @@ from livemem.index import TieredIndex
 from livemem.types import (
     Edge,
     EdgeType,
+    IngestInput,
     Node,
     RetrievalResult,
     Tier,
@@ -96,6 +97,14 @@ class LiveMem:
         self._index = TieredIndex(cfg)
         self._last_sleep_end: float = 0.0
         self._lock = threading.RLock()
+        self._compression_stats: dict[str, float | int] = {
+            "runs": 0,
+            "clusters_fused": 0,
+            "nodes_removed": 0,
+            "nodes_created": 0,
+            "nodes_saved": 0,
+            "last_run_at": 0.0,
+        }
         # Cross-encoder re-ranker — lazy-loaded on first retrieve() call
         # when cfg.reranker_enabled is True. Always instantiated so the
         # object is ready; model download is deferred until rerank().
@@ -124,6 +133,69 @@ class LiveMem:
         self._last_sleep_end = value
 
     # ── Awake ingestion ────────────────────────────────────────────────────────
+
+    def _ingest_awake_unlocked(self, payload: IngestInput) -> str:
+        """Internal ingest primitive.
+
+        WHY a dedicated unlocked helper:
+            Batch ingest should hold the engine lock once and reuse the
+            exact same insertion semantics for every item. Keeping the real
+            logic in one helper prevents single-ingest and batch-ingest from
+            drifting apart over time.
+        """
+        now = time.time()
+        v = self._embedder.embed(payload.summary)
+
+        # Query SHORT index BEFORE adding the new node.
+        candidates = self._index.query(Tier.SHORT, v, self._cfg.k_awake)
+
+        # s_base scales with importance: lerp(s_base_init, 1.0, importance).
+        # WHY: a critical fact (imp=1.0) should start at full strength so it
+        # stays in SHORT longer and outranks trivial nodes in retrieval.
+        # A background fact (imp=0.0) still gets the floor so it can form
+        # edges before drifting to LONG over the next sleep cycle.
+        s_base = self._cfg.s_base_init + payload.importance * (1.0 - self._cfg.s_base_init)
+        node = Node(
+            v=v,
+            summary=payload.summary,
+            ref_uri=payload.ref_uri,
+            ref_type=payload.ref_type,
+            importance=payload.importance,
+            urgency=payload.urgency,
+            s_base=s_base,
+            t=now,
+            t_accessed=now,
+            tier=Tier.SHORT,
+        )
+
+        # Create DIRECT edges to similar existing SHORT nodes.
+        for nb_id, cos in candidates:
+            if cos < self._cfg.theta_min:
+                continue
+            if nb_id not in self._graph:
+                continue
+            nb_node = self._graph.V[nb_id]
+            # Enforce direction: newer (higher t) → older (lower t).
+            if node.t >= nb_node.t:
+                from_id, to_id = node.id, nb_id
+                delta_t = node.t - nb_node.t
+            else:
+                from_id, to_id = nb_id, node.id
+                delta_t = nb_node.t - node.t
+            edge = Edge(
+                from_id=from_id,
+                to_id=to_id,
+                cos_sim=cos,
+                delta_t=delta_t,
+                edge_type=EdgeType.DIRECT,
+            )
+            self._graph.add_edge_if_new(edge)
+
+        self._graph.add_node(node)
+        self._index.add(node.id, v, Tier.SHORT)
+
+        logger.debug("ingest_awake: %s → %s", node.id[:8], payload.summary[:50])
+        return node.id
 
     def ingest_awake(
         self,
@@ -162,60 +234,29 @@ class LiveMem:
         -------
         str — UUID of the newly created node.
         """
+        payload = IngestInput(
+            summary=summary,
+            ref_uri=ref_uri,
+            ref_type=ref_type,
+            importance=importance,
+            urgency=urgency,
+        )
         with self._lock:
-            now = time.time()
-            v = self._embedder.embed(summary)
+            return self._ingest_awake_unlocked(payload)
 
-            # Query SHORT index BEFORE adding the new node.
-            candidates = self._index.query(Tier.SHORT, v, self._cfg.k_awake)
+    def ingest_awake_batch(self, items: list[IngestInput]) -> list[str]:
+        """Ingest multiple memory units under one engine lock.
 
-            # s_base scales with importance: lerp(s_base_init, 1.0, importance).
-            # WHY: a critical fact (imp=1.0) should start at full strength so it
-            # stays in SHORT longer and outranks trivial nodes in retrieval.
-            # A background fact (imp=0.0) still gets the floor so it can form
-            # edges before drifting to LONG over the next sleep cycle.
-            s_base = self._cfg.s_base_init + importance * (1.0 - self._cfg.s_base_init)
-            node = Node(
-                v=v,
-                summary=summary,
-                ref_uri=ref_uri,
-                ref_type=ref_type,
-                importance=importance,
-                urgency=urgency,
-                s_base=s_base,
-                t=now,
-                t_accessed=now,
-                tier=Tier.SHORT,
-            )
-
-            # Create DIRECT edges to similar existing SHORT nodes.
-            for nb_id, cos in candidates:
-                if cos < self._cfg.theta_min:
-                    continue
-                if nb_id not in self._graph:
-                    continue
-                nb_node = self._graph.V[nb_id]
-                # Enforce direction: newer (higher t) → older (lower t).
-                if node.t >= nb_node.t:
-                    from_id, to_id = node.id, nb_id
-                    delta_t = node.t - nb_node.t
-                else:
-                    from_id, to_id = nb_id, node.id
-                    delta_t = nb_node.t - node.t
-                edge = Edge(
-                    from_id=from_id,
-                    to_id=to_id,
-                    cos_sim=cos,
-                    delta_t=delta_t,
-                    edge_type=EdgeType.DIRECT,
-                )
-                self._graph.add_edge_if_new(edge)
-
-            self._graph.add_node(node)
-            self._index.add(node.id, v, Tier.SHORT)
-
-            logger.debug("ingest_awake: %s → %s", node.id[:8], summary[:50])
-            return node.id
+        WHY batch ingest exists:
+            Agent pipelines and ingestion adapters often collect several
+            facts at once from one source. Locking once avoids repeated
+            thread hand-offs and keeps the local SHORT-tier neighborhood
+            coherent across the batch.
+        """
+        if not items:
+            return []
+        with self._lock:
+            return [self._ingest_awake_unlocked(item) for item in items]
 
     async def ingest_awake_async(
         self,
@@ -234,6 +275,13 @@ class LiveMem:
             importance,
             urgency,
         )
+
+    async def ingest_awake_batch_async(
+        self,
+        items: list[IngestInput],
+    ) -> list[str]:
+        """Async wrapper for ingest_awake_batch using a worker thread."""
+        return await asyncio.to_thread(self.ingest_awake_batch, items)
 
     # ── Sleep phase ────────────────────────────────────────────────────────────
 
@@ -530,6 +578,9 @@ class LiveMem:
         )
         clusters = self.greedy_cluster(Tier.LONG, self._cfg.theta_compress)
         now = time.time()
+        run_clusters_fused = 0
+        run_nodes_removed = 0
+        run_nodes_created = 0
 
         for cluster_ids in clusters:
             if len(cluster_ids) < 2:
@@ -572,6 +623,7 @@ class LiveMem:
                 # but we also need to remove from the tier index explicitly).
                 # Note: graph.remove_node does NOT touch the index — we do it here.
                 self._index.remove(mid, Tier.LONG)
+                run_nodes_removed += 1
 
             # Create consolidated node.
             # WHY urgency=0.0: a fused/archived node is by definition not
@@ -594,6 +646,8 @@ class LiveMem:
             )
             self._graph.add_node(fused)
             self._index.add(fused.id, v_f, Tier.LONG)
+            run_clusters_fused += 1
+            run_nodes_created += 1
 
             # Reconnect external neighbours.
             for ext_id in external:
@@ -619,11 +673,36 @@ class LiveMem:
                 )
                 self._graph.add_edge_if_new(edge)
 
+        if run_clusters_fused > 0:
+            self._compression_stats["runs"] += 1
+            self._compression_stats["clusters_fused"] += run_clusters_fused
+            self._compression_stats["nodes_removed"] += run_nodes_removed
+            self._compression_stats["nodes_created"] += run_nodes_created
+            self._compression_stats["nodes_saved"] += (
+                run_nodes_removed - run_nodes_created
+            )
+            self._compression_stats["last_run_at"] = now
+
         logger.info("sleep_compress: done")
 
     # ── Retrieval ──────────────────────────────────────────────────────────────
 
     def retrieve(
+        self, query_text: str, k: int = 10
+    ) -> list[RetrievalResult]:
+        """Thread-safe retrieval entrypoint.
+
+        WHY retrieve takes the engine lock:
+            Retrieval is not a pure read in LiveMem. It reinforces returned
+            nodes, updates access timestamps, and may move nodes across tiers.
+            Without an engine-level lock, concurrent ingest/retrieve/sleep
+            calls can race on the graph and HNSW indexes even outside the
+            REST API wrapper.
+        """
+        with self._lock:
+            return self._retrieve_unlocked(query_text, k)
+
+    def _retrieve_unlocked(
         self, query_text: str, k: int = 10
     ) -> list[RetrievalResult]:
         """Retrieve the top-k most relevant memory nodes for a query.
@@ -1023,6 +1102,7 @@ class LiveMem:
                     "MEDIUM": self._index.size(Tier.MEDIUM),
                     "LONG": self._index.size(Tier.LONG),
                 },
+                "compression_stats": dict(self._compression_stats),
                 "last_sleep_end": self._last_sleep_end,
             }
 

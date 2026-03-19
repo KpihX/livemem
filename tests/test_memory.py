@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from livemem.config import LiveConfig
-from livemem.types import Tier
+from livemem.types import IngestInput, Tier
 from tests.conftest import make_node
 
 
@@ -101,6 +101,20 @@ def test_ingest_all_start_in_short(fresh_mem):
 def test_ingest_importance_stored(fresh_mem):
     nid = fresh_mem.ingest_awake("Capital memory", importance=1.0)
     assert abs(fresh_mem.graph.V[nid].importance - 1.0) < 1e-6
+
+
+def test_batch_ingest_returns_all_ids_and_populates_short(fresh_mem):
+    node_ids = fresh_mem.ingest_awake_batch(
+        [
+            IngestInput(summary="Batch fact one", importance=0.4),
+            IngestInput(summary="Batch fact two", importance=0.8, urgency=0.9),
+            IngestInput(summary="Batch fact three", ref_type="url"),
+        ]
+    )
+    assert len(node_ids) == 3
+    assert len(set(node_ids)) == 3
+    assert fresh_mem.graph.total_nodes() == 3
+    assert all(fresh_mem.graph.V[nid].tier == Tier.SHORT for nid in node_ids)
 
 
 # ── retrieve ───────────────────────────────────────────────────────────────────
@@ -211,3 +225,9 @@ def test_status_counts_correct_after_ingestion(fresh_mem):
     assert s["tier_counts"]["SHORT"] == 3
     assert s["tier_counts"]["MEDIUM"] == 0
     assert s["tier_counts"]["LONG"] == 0
+
+
+def test_status_exposes_compression_stats(fresh_mem):
+    s = fresh_mem.status()
+    assert s["compression_stats"]["runs"] == 0
+    assert s["compression_stats"]["clusters_fused"] == 0

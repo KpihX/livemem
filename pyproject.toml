@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "livemem"
-version = "0.3.0"
+version = "0.3.1"
 description = "Brain-inspired living graph memory: 3 tiers, HNSW ANN, sleep consolidation, multimodal refs"
 readme = "README.md"
 requires-python = ">=3.11"

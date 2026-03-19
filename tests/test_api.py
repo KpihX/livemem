@@ -99,6 +99,7 @@ def test_sleep_endpoint_returns_updated_status(tmp_path: Path) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["total_nodes"] == 1
+    assert "compression_stats" in body
     assert body["last_sleep_end"] > 0.0
 
 
@@ -120,3 +121,34 @@ def test_state_reloads_across_app_instances(tmp_path: Path) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["total_nodes"] == 1
+
+
+def test_batch_ingest_endpoint_persists_multiple_items(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    with _build_client(state_path) as client:
+        response = client.post(
+            "/ingest/batch",
+            json={
+                "items": [
+                    {
+                        "summary": "Coffee improves perceived productivity in the morning",
+                        "importance": 0.3,
+                        "urgency": 0.0,
+                    },
+                    {
+                        "summary": "DEADLINE: submit report by 5pm",
+                        "importance": 0.7,
+                        "urgency": 0.95,
+                    },
+                ]
+            },
+        )
+        status = client.get("/status")
+
+    assert response.status_code == 200
+    assert status.status_code == 200
+    body = response.json()
+    status_body = status.json()
+    assert len(body["items"]) == 2
+    assert status_body["total_nodes"] == 2
+    assert status_body["tier_counts"]["SHORT"] == 2

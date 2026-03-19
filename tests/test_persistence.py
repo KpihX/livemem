@@ -139,6 +139,25 @@ def test_save_load_preserves_last_sleep_end(populated_mem, tmp_path_json, small_
     assert abs(loaded.last_sleep_end - 1234567.89) < 1e-3
 
 
+def test_save_load_preserves_compression_stats(populated_mem, tmp_path_json, small_config):
+    populated_mem._compression_stats.update(  # type: ignore[attr-defined]
+        {
+            "runs": 2,
+            "clusters_fused": 3,
+            "nodes_removed": 9,
+            "nodes_created": 3,
+            "nodes_saved": 6,
+            "last_run_at": 12345.6,
+        }
+    )
+    save(populated_mem, tmp_path_json)
+    loaded = load(tmp_path_json, cfg=small_config, mock=True)
+    stats = loaded.status()["compression_stats"]
+    assert stats["runs"] == 2
+    assert stats["clusters_fused"] == 3
+    assert stats["nodes_saved"] == 6
+
+
 # ── Error cases ───────────────────────────────────────────────────────────────
 
 def test_load_nonexistent_raises_file_not_found(tmp_path, small_config):

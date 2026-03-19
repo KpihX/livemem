@@ -12,7 +12,7 @@ A Python prototype of a living, brain-inspired memory system. Nodes are semantic
 ┌─────────────────────────────────────────────────────────┐
 │                     AWAKE SESSION                        │
 │                                                         │
-│  ingest_awake(summary, ref_uri, ref_type, importance)   │
+│  ingest_awake(...) / ingest_awake_batch([...])          │
 │      │                                                  │
 │      ▼                                                  │
 │  embed(summary) → unit-norm vector v                    │
@@ -62,7 +62,8 @@ A Python prototype of a living, brain-inspired memory system. Nodes are semantic
 │    summary: str      ← ≤200 chars                       │
 │    ref_uri: str|None ← path or URL to actual content    │
 │    ref_type: str     ← text|image|audio|video|url       │
-│    importance: Importance  ← WEAK=0..CAPITAL=3          │
+│    importance: float    ← continuous [0,1]              │
+│    urgency: float       ← continuous [0,1]              │
 │    s_base: float     ← current base strength [0,1]      │
 │    t: float          ← creation unix timestamp          │
 │    t_accessed: float ← last access unix timestamp       │
@@ -81,9 +82,10 @@ A Python prototype of a living, brain-inspired memory system. Nodes are semantic
 │  score(n) = α·cos(q,v)   direct semantic match          │
 │           + β·traversal  1-hop graph context            │
 │           + γ·s_eff      recency/reinforcement          │
-│           + δ·(imp/3)    importance bonus               │
+│           + δ·imp        importance bonus               │
+│           + ε·u_eff      urgency bonus                  │
 │                                                         │
-│  α=0.50, β=0.25, γ=0.15, δ=0.10  (sum = 1.0)           │
+│  α=0.45, β=0.20, γ=0.15, δ=0.12, ε=0.08                │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -140,12 +142,18 @@ livemem serve --mock
 livemem serve --host 0.0.0.0 --port 8080 --state-path /tmp/livemem.json
 ```
 
+### `ingest-batch`
+```bash
+livemem ingest-batch ./batch.json --mock
+```
+
 ---
 
 ## Python API
 
 ```python
 from livemem import LiveMem, LiveConfig, save, load
+from livemem.types import IngestInput
 
 # Create with defaults (uses fastembed for embeddings):
 mem = LiveMem()
@@ -160,6 +168,14 @@ node_id = mem.ingest_awake(
     ref_type="url",
     importance=0.7,
     urgency=0.2,
+)
+
+# Batch ingest
+node_ids = mem.ingest_awake_batch(
+    [
+        IngestInput(summary="Short fact one", importance=0.4),
+        IngestInput(summary="DEADLINE: send the report", urgency=0.95),
+    ]
 )
 
 # Retrieve
@@ -203,6 +219,7 @@ Endpoints:
 GET  /health
 GET  /status
 POST /ingest
+POST /ingest/batch
 POST /retrieve
 POST /sleep
 ```
@@ -222,9 +239,20 @@ curl -X POST http://127.0.0.1:8000/ingest \
 curl -X POST http://127.0.0.1:8000/retrieve \
   -H 'content-type: application/json' \
   -d '{"query": "coffee weather sky today", "k": 5}'
+
+curl -X POST http://127.0.0.1:8000/ingest/batch \
+  -H 'content-type: application/json' \
+  -d '{
+    "items": [
+      {"summary": "Coffee improves perceived productivity", "importance": 0.3},
+      {"summary": "DEADLINE: submit report by 5pm", "importance": 0.7, "urgency": 0.95}
+    ]
+  }'
 ```
 
 The API persists state to `~/.livemem/state.json` by default, exactly like the CLI.
+`/status` also exposes cumulative compression stats (`runs`, `clusters_fused`,
+`nodes_removed`, `nodes_created`, `nodes_saved`, `last_run_at`).
 
 ---
 
@@ -243,7 +271,7 @@ The API persists state to `~/.livemem/state.json` by default, exactly like the C
 | `theta_min` | 0.60 | Min cosine for any edge |
 | `theta_sleep` | 0.75 | Min cosine for SLEEP edges |
 | `theta_compress` | 0.90 | Min cosine for cluster fusion |
-| `decay_lambda` | 1e-5 | Ebbinghaus decay rate (per second) |
+| `decay_lambda` | 5e-6 | Ebbinghaus decay rate (per second) |
 | `delta_reinforce` | 0.10 | Strength boost per reinforcement |
 | `tau_long` | 1800 (30min) | Idle threshold for SHORT→LONG diffusion |
 | `idle_ttl` | 300 (5min) | Daemon sleep trigger threshold |
@@ -257,7 +285,7 @@ The API persists state to `~/.livemem/state.json` by default, exactly like the C
 uv run pytest tests/ -v --cov=livemem
 ```
 
-Test coverage: 10 test files, 153 tests covering types, graph, index, memory, retrieval, urgency sweep, sleep, persistence, daemon, and REST API.
+Test coverage: 10 test files, 157 tests covering types, graph, index, memory, retrieval, urgency sweep, sleep, persistence, daemon, and REST API.
 
 ---
 
