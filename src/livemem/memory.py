@@ -161,6 +161,12 @@ class LiveMem:
         # Query SHORT index BEFORE adding the new node.
         candidates = self._index.query(Tier.SHORT, v, self._cfg.k_awake)
 
+        # s_base scales with importance: lerp(s_base_init, 1.0, importance).
+        # WHY: a critical fact (imp=1.0) should start at full strength so it
+        # stays in SHORT longer and outranks trivial nodes in retrieval.
+        # A background fact (imp=0.0) still gets the floor so it can form
+        # edges before drifting to LONG over the next sleep cycle.
+        s_base = self._cfg.s_base_init + importance * (1.0 - self._cfg.s_base_init)
         node = Node(
             v=v,
             summary=summary,
@@ -168,7 +174,7 @@ class LiveMem:
             ref_type=ref_type,
             importance=importance,
             urgency=urgency,
-            s_base=self._cfg.s_base_init,
+            s_base=s_base,
             t=now,
             t_accessed=now,
             tier=Tier.SHORT,

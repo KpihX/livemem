@@ -120,11 +120,14 @@ class LiveConfig:
     allows them to age from SHORT → MEDIUM but never → LONG."""
 
     # ── Forgetting / reinforcement ────────────────────────────────────────────
-    decay_lambda: float = 1e-5
+    decay_lambda: float = 5e-6
     """Ebbinghaus exponential decay rate (per second).
-    WHY: models natural forgetting. At λ=1e-5 a node reaches ~37% of
-    its initial strength after ~27.7 hours of no access — matching
-    typical short-term memory half-life."""
+    WHY: models natural forgetting. At λ=5e-6 the half-life of s_eff
+    is ~1.6 days — a fresh node stays above 50% strength for nearly
+    two days without reinforcement, then fades over the following week.
+    Previous value 1e-5 (half-life ~19h) was too aggressive for agent
+    memory: critical facts injected in the morning would be nearly gone
+    by evening without a retrieval event."""
 
     delta_reinforce: float = 0.10
     """Strength boost applied per reinforcement (retrieval or sleep link).
@@ -192,9 +195,13 @@ class LiveConfig:
 
     # ── Initialization ────────────────────────────────────────────────────────
     s_base_init: float = 0.5
-    """Initial base strength assigned to every new node.
-    WHY: 0.5 (mid-range) gives new nodes a decent starting foothold
-    without making them immediately dominant over well-rehearsed nodes."""
+    """Floor strength for new nodes — used as the minimum s_base.
+    WHY: actual s_base at ingestion is lerp(s_base_init, 1.0, importance)
+    so a critical node (imp=1.0) starts at s_base=1.0, a trivial one
+    (imp=0.0) starts at s_base=s_base_init (0.5).  Keeping 0.5 as the
+    floor ensures even irrelevant nodes have enough initial strength to
+    form edges and be retrievable for at least one sleep cycle before
+    they drift to LONG."""
 
     # ── HNSW index parameters ─────────────────────────────────────────────────
     hnsw_max_elements: int = 50_000
