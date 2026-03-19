@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## [0.3.0] — 2026-03-19
+
+### Added
+- [x] `livemem.api`: FastAPI microservice exposing `/health`, `/status`, `/ingest`, `/retrieve`, and `/sleep`
+- [x] `LiveMem.ingest_awake_async / retrieve_async / sleep_phase_async / status_async`: async wrappers using `asyncio.to_thread`
+- [x] `livemem serve`: CLI command to run the REST API locally via uvicorn
+- [x] `tests/test_api.py`: HTTP contract tests covering health, ingest, retrieve, sleep, and persisted reload
+- [x] `tests/test_urgency_retrieval.py`: dedicated retrieval tests for urgency sweep and cross-encoder reranking
+
+### Fixed
+- [x] `retrieve()` urgency guarantee is now real, not just candidate-pool admission: urgent nodes are explicitly preserved in final top-k selection
+- [x] `retrieve()` ranking remains score-descending after urgent-node forcing via minimal score lift
+- [x] `retrieve()` result materialisation no longer exits after the first row when building `RetrievalResult` objects
+
 ## [0.2.0] — 2026-03-19
 
 ### Added

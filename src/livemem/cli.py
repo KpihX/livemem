@@ -14,10 +14,12 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+import uvicorn
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from livemem.api import create_app
 from livemem.config import DEFAULT_CONFIG, LiveConfig
 from livemem.embedder import make_embedder
 from livemem.memory import LiveMem
@@ -340,6 +342,22 @@ def demo(
     # Save demo state.
     _save_state(mem)
     console.print(f"[dim]State saved to {_STATE_PATH}[/]")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host."),
+    port: int = typer.Option(8000, "--port", help="Bind port."),
+    mock: bool = typer.Option(False, "--mock", help="Use mock embedder instead of fastembed."),
+    state_path: Optional[Path] = typer.Option(None, "--state-path", help="Override persisted state path."),
+) -> None:
+    """Run the LiveMem REST API."""
+    app_instance = create_app(
+        cfg=DEFAULT_CONFIG,
+        mock=mock,
+        state_path=state_path,
+    )
+    uvicorn.run(app_instance, host=host, port=port)
 
 
 if __name__ == "__main__":

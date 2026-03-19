@@ -106,9 +106,9 @@ uv run livemem --help
 
 ### `ingest`
 ```bash
-livemem ingest "Python uses GIL for thread safety" --importance key
+livemem ingest "Python uses GIL for thread safety" --importance 0.7
 livemem ingest "Photo of the lab" --ref-uri /images/lab.jpg --ref-type image
-livemem ingest "Podcast episode" --ref-uri /audio/ep1.mp3 --ref-type audio --mock
+livemem ingest "Podcast episode" --ref-uri /audio/ep1.mp3 --ref-type audio --urgency 0.9 --mock
 ```
 
 ### `retrieve`
@@ -134,12 +134,18 @@ livemem demo --mock   # 25 diverse facts, no model download
 livemem demo --real   # Uses fastembed BAAI/bge-small-en-v1.5
 ```
 
+### `serve`
+```bash
+livemem serve --mock
+livemem serve --host 0.0.0.0 --port 8080 --state-path /tmp/livemem.json
+```
+
 ---
 
 ## Python API
 
 ```python
-from livemem import LiveMem, LiveConfig, Importance, save, load
+from livemem import LiveMem, LiveConfig, save, load
 
 # Create with defaults (uses fastembed for embeddings):
 mem = LiveMem()
@@ -152,7 +158,8 @@ node_id = mem.ingest_awake(
     summary="The Eiffel Tower was built in 1889.",
     ref_uri="https://en.wikipedia.org/wiki/Eiffel_Tower",
     ref_type="url",
-    importance=Importance.KEY,
+    importance=0.7,
+    urgency=0.2,
 )
 
 # Retrieve
@@ -173,7 +180,51 @@ daemon = SleepDaemon(mem, mem.cfg)
 await daemon.start()
 # ... application runs ...
 await daemon.stop()
+
+# Async wrappers (for service integrations)
+node_id = await mem.ingest_awake_async("Urgent task", urgency=0.95)
+results = await mem.retrieve_async("urgent", k=5)
+await mem.sleep_phase_async(idle_duration=600.0)
 ```
+
+---
+
+## REST API
+
+Run locally:
+
+```bash
+livemem serve --mock
+```
+
+Endpoints:
+
+```text
+GET  /health
+GET  /status
+POST /ingest
+POST /retrieve
+POST /sleep
+```
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/ingest \
+  -H 'content-type: application/json' \
+  -d '{
+    "summary": "DEADLINE: submit report by 5pm",
+    "ref_type": "text",
+    "importance": 0.7,
+    "urgency": 0.95
+  }'
+
+curl -X POST http://127.0.0.1:8000/retrieve \
+  -H 'content-type: application/json' \
+  -d '{"query": "coffee weather sky today", "k": 5}'
+```
+
+The API persists state to `~/.livemem/state.json` by default, exactly like the CLI.
 
 ---
 
@@ -206,7 +257,7 @@ await daemon.stop()
 uv run pytest tests/ -v --cov=livemem
 ```
 
-Test coverage: 8 test files, ~100 tests covering types, graph, index, memory, sleep, retrieval, persistence, and daemon.
+Test coverage: 10 test files, 153 tests covering types, graph, index, memory, retrieval, urgency sweep, sleep, persistence, daemon, and REST API.
 
 ---
 
@@ -215,12 +266,13 @@ Test coverage: 8 test files, ~100 tests covering types, graph, index, memory, sl
 ```
 src/livemem/
 ├── __init__.py      — public API exports
+├── api.py           — FastAPI microservice surface
 ├── config.py        — LiveConfig frozen dataclass
-├── types.py         — Node, Edge, Importance, Tier, strength_effective, tier_fn
+├── types.py         — Node, Edge, Tier, strength_effective, urgency_effective, tier_fn
 ├── graph.py         — directed graph with tier-bucketed SortedLists
 ├── index.py         — hnswlib HNSW per-tier ANN index
-├── embedder.py      — MockEmbedder + RealEmbedder (fastembed)
-├── memory.py        — LiveMem orchestrator (ingest, sleep, retrieve)
+├── embedder.py      — MockEmbedder + RealEmbedder + CrossEncoderReranker
+├── memory.py        — LiveMem orchestrator (ingest, sleep, retrieve, async wrappers)
 ├── daemon.py        — asyncio SleepDaemon
 ├── persistence.py   — JSON save/load
 └── cli.py           — Typer CLI

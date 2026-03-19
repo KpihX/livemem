@@ -23,6 +23,7 @@ from livemem.daemon import SleepDaemon
 from livemem.memory import LiveMem
 from livemem.persistence import load, save
 from livemem.types import Edge, Node, RetrievalResult, Tier
+from livemem.api import create_app
 
 __all__ = [
     "LiveMem",
@@ -33,8 +34,9 @@ __all__ = [
     "Edge",
     "RetrievalResult",
     "SleepDaemon",
+    "create_app",
     "save",
     "load",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

@@ -16,7 +16,9 @@ WHY a single orchestrator class:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -93,6 +95,7 @@ class LiveMem:
         self._graph = Graph()
         self._index = TieredIndex(cfg)
         self._last_sleep_end: float = 0.0
+        self._lock = threading.RLock()
         # Cross-encoder re-ranker — lazy-loaded on first retrieve() call
         # when cfg.reranker_enabled is True. Always instantiated so the
         # object is ready; model download is deferred until rerank().
@@ -159,59 +162,78 @@ class LiveMem:
         -------
         str — UUID of the newly created node.
         """
-        now = time.time()
-        v = self._embedder.embed(summary)
+        with self._lock:
+            now = time.time()
+            v = self._embedder.embed(summary)
 
-        # Query SHORT index BEFORE adding the new node.
-        candidates = self._index.query(Tier.SHORT, v, self._cfg.k_awake)
+            # Query SHORT index BEFORE adding the new node.
+            candidates = self._index.query(Tier.SHORT, v, self._cfg.k_awake)
 
-        # s_base scales with importance: lerp(s_base_init, 1.0, importance).
-        # WHY: a critical fact (imp=1.0) should start at full strength so it
-        # stays in SHORT longer and outranks trivial nodes in retrieval.
-        # A background fact (imp=0.0) still gets the floor so it can form
-        # edges before drifting to LONG over the next sleep cycle.
-        s_base = self._cfg.s_base_init + importance * (1.0 - self._cfg.s_base_init)
-        node = Node(
-            v=v,
-            summary=summary,
-            ref_uri=ref_uri,
-            ref_type=ref_type,
-            importance=importance,
-            urgency=urgency,
-            s_base=s_base,
-            t=now,
-            t_accessed=now,
-            tier=Tier.SHORT,
-        )
-
-        # Create DIRECT edges to similar existing SHORT nodes.
-        for nb_id, cos in candidates:
-            if cos < self._cfg.theta_min:
-                continue
-            if nb_id not in self._graph:
-                continue
-            nb_node = self._graph.V[nb_id]
-            # Enforce direction: newer (higher t) → older (lower t).
-            if node.t >= nb_node.t:
-                from_id, to_id = node.id, nb_id
-                delta_t = node.t - nb_node.t
-            else:
-                from_id, to_id = nb_id, node.id
-                delta_t = nb_node.t - node.t
-            edge = Edge(
-                from_id=from_id,
-                to_id=to_id,
-                cos_sim=cos,
-                delta_t=delta_t,
-                edge_type=EdgeType.DIRECT,
+            # s_base scales with importance: lerp(s_base_init, 1.0, importance).
+            # WHY: a critical fact (imp=1.0) should start at full strength so it
+            # stays in SHORT longer and outranks trivial nodes in retrieval.
+            # A background fact (imp=0.0) still gets the floor so it can form
+            # edges before drifting to LONG over the next sleep cycle.
+            s_base = self._cfg.s_base_init + importance * (1.0 - self._cfg.s_base_init)
+            node = Node(
+                v=v,
+                summary=summary,
+                ref_uri=ref_uri,
+                ref_type=ref_type,
+                importance=importance,
+                urgency=urgency,
+                s_base=s_base,
+                t=now,
+                t_accessed=now,
+                tier=Tier.SHORT,
             )
-            self._graph.add_edge_if_new(edge)
 
-        self._graph.add_node(node)
-        self._index.add(node.id, v, Tier.SHORT)
+            # Create DIRECT edges to similar existing SHORT nodes.
+            for nb_id, cos in candidates:
+                if cos < self._cfg.theta_min:
+                    continue
+                if nb_id not in self._graph:
+                    continue
+                nb_node = self._graph.V[nb_id]
+                # Enforce direction: newer (higher t) → older (lower t).
+                if node.t >= nb_node.t:
+                    from_id, to_id = node.id, nb_id
+                    delta_t = node.t - nb_node.t
+                else:
+                    from_id, to_id = nb_id, node.id
+                    delta_t = nb_node.t - node.t
+                edge = Edge(
+                    from_id=from_id,
+                    to_id=to_id,
+                    cos_sim=cos,
+                    delta_t=delta_t,
+                    edge_type=EdgeType.DIRECT,
+                )
+                self._graph.add_edge_if_new(edge)
 
-        logger.debug("ingest_awake: %s → %s", node.id[:8], summary[:50])
-        return node.id
+            self._graph.add_node(node)
+            self._index.add(node.id, v, Tier.SHORT)
+
+            logger.debug("ingest_awake: %s → %s", node.id[:8], summary[:50])
+            return node.id
+
+    async def ingest_awake_async(
+        self,
+        summary: str,
+        ref_uri: str | None = None,
+        ref_type: str = "text",
+        importance: float = 0.5,
+        urgency: float = 0.0,
+    ) -> str:
+        """Async wrapper for ingest_awake using a worker thread."""
+        return await asyncio.to_thread(
+            self.ingest_awake,
+            summary,
+            ref_uri,
+            ref_type,
+            importance,
+            urgency,
+        )
 
     # ── Sleep phase ────────────────────────────────────────────────────────────
 
@@ -236,11 +258,16 @@ class LiveMem:
                         sleep_diffuse to decide whether to bridge SHORT→LONG.
         """
         logger.info("sleep_phase start (idle=%.0fs)", idle_duration)
-        self._decay_pass()
-        self.sleep_diffuse(idle_duration)
-        self.sleep_promote()
-        self.sleep_compress()
-        self._last_sleep_end = time.time()
+        with self._lock:
+            self._decay_pass()
+            self.sleep_diffuse(idle_duration)
+            self.sleep_promote()
+            self.sleep_compress()
+            self._last_sleep_end = time.time()
+
+    async def sleep_phase_async(self, idle_duration: float = 0.0) -> None:
+        """Async wrapper for sleep_phase using a worker thread."""
+        await asyncio.to_thread(self.sleep_phase, idle_duration)
         logger.info("sleep_phase complete")
 
     def sleep_diffuse(self, idle_duration: float) -> None:
@@ -735,6 +762,67 @@ class LiveMem:
         # Sort descending by 5-component score.
         scored.sort(reverse=True)
 
+        def select_top_k_with_urgent_guarantee(
+            ranked: list[tuple[float, str]],
+            limit: int,
+        ) -> list[tuple[float, str]]:
+            """Guarantee urgency-pinned nodes survive the final top-k slice.
+
+            WHY this extra pass:
+                Putting urgent nodes into `all_candidates` is not sufficient.
+                A low-cosine urgent node can still be cut during the final
+                top-k truncation after scoring. The contract of the urgency
+                tier is stronger: any node with u_eff >= theta_urgent must
+                surface in the returned results, even if its semantic match
+                to the current query is weak.
+
+            Policy:
+                1. Keep the current ranking order inside the urgent subset.
+                2. Keep the current ranking order inside the non-urgent subset.
+                3. Reserve final slots for all urgent nodes (up to k).
+                4. Lift the returned urgent scores by a tiny epsilon above the
+                   best non-urgent candidate kept in the same slice.
+
+            WHY the epsilon lift:
+                RetrievalResult.score should reflect the actual ranking order.
+                Simply reordering urgent nodes ahead of higher-scoring normal
+                nodes would make the output appear unsorted and would lie about
+                the ranking criterion. The epsilon is tiny enough to preserve
+                the base score geometry while making the urgent guarantee
+                explicit in the returned ranking score.
+            """
+            if not urgent_forced or limit <= 0:
+                return ranked[:limit]
+            urgent_ranked = [item for item in ranked if item[1] in urgent_forced]
+            normal_ranked = [item for item in ranked if item[1] not in urgent_forced]
+
+            # No guarantee work needed if every urgent node already survives the
+            # regular top-k cut.
+            default_top = ranked[:limit]
+            default_ids = {nid for _score, nid in default_top}
+            urgent_ids = {nid for _score, nid in urgent_ranked}
+            if urgent_ids.issubset(default_ids):
+                return default_top
+
+            kept_urgent = urgent_ranked[:limit]
+            remaining = max(0, limit - len(kept_urgent))
+            kept_normal = normal_ranked[:remaining]
+
+            max_normal_score = max((score for score, _nid in kept_normal), default=0.0)
+            max_urgent_score = max((score for score, _nid in kept_urgent), default=0.0)
+            boost_anchor = max(max_normal_score, max_urgent_score)
+            eps = 1e-6
+
+            boosted_urgent: list[tuple[float, str]] = []
+            n_urgent = len(kept_urgent)
+            for idx, (score, nid) in enumerate(kept_urgent):
+                # Higher-ranked urgent nodes get a slightly larger lift so the
+                # subset remains internally sorted.
+                urgent_boost = boost_anchor + eps * (n_urgent - idx)
+                boosted_urgent.append((max(score, urgent_boost), nid))
+
+            return boosted_urgent + kept_normal
+
         # ── 6. Optional cross-encoder re-ranking ──────────────────────────────
         if self._cfg.reranker_enabled:
             # Expand the pool to reranker_k candidates, then re-rank them.
@@ -742,7 +830,7 @@ class LiveMem:
             # position 8 (just outside top-k). Feeding reranker_k > k into
             # the cross-encoder lets it promote it to the top.
             pool_size = max(k, self._cfg.reranker_k)
-            pool = scored[:pool_size]
+            pool = select_top_k_with_urgent_guarantee(scored, pool_size)
             # Build (node_id, summary) pairs for the cross-encoder.
             ce_candidates: list[tuple[str, str]] = []
             for _score, nid in pool:
@@ -751,14 +839,14 @@ class LiveMem:
             # Cross-encoder returns (ce_score, node_id) sorted descending.
             reranked = self._reranker.rerank(query_text, ce_candidates)
             # Rebuild top_k as (ce_score, node_id) for the final slice.
-            top_k: list[tuple[float, str]] = reranked[:k]
+            top_k: list[tuple[float, str]] = select_top_k_with_urgent_guarantee(reranked, k)
             logger.debug(
                 "Cross-encoder reranked %d candidates → top-%d.",
                 len(ce_candidates),
                 k,
             )
         else:
-            top_k = scored[:k]
+            top_k = select_top_k_with_urgent_guarantee(scored, k)
 
         # ── 7. Reinforce returned nodes ───────────────────────────────────────
         results: list[RetrievalResult] = []
@@ -783,6 +871,14 @@ class LiveMem:
             )
 
         return results
+
+    async def retrieve_async(
+        self,
+        query_text: str,
+        k: int = 10,
+    ) -> list[RetrievalResult]:
+        """Async wrapper for retrieve using a worker thread."""
+        return await asyncio.to_thread(self.retrieve, query_text, k)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -913,18 +1009,23 @@ class LiveMem:
         WHY: used by CLI and daemon to display human-readable stats
         without exposing internal graph structures.
         """
-        return {
-            "total_nodes": self._graph.total_nodes(),
-            "total_edges": self._graph.total_edges(),
-            "tier_counts": {
-                "SHORT": self._graph.tier_size(Tier.SHORT),
-                "MEDIUM": self._graph.tier_size(Tier.MEDIUM),
-                "LONG": self._graph.tier_size(Tier.LONG),
-            },
-            "index_sizes": {
-                "SHORT": self._index.size(Tier.SHORT),
-                "MEDIUM": self._index.size(Tier.MEDIUM),
-                "LONG": self._index.size(Tier.LONG),
-            },
-            "last_sleep_end": self._last_sleep_end,
-        }
+        with self._lock:
+            return {
+                "total_nodes": self._graph.total_nodes(),
+                "total_edges": self._graph.total_edges(),
+                "tier_counts": {
+                    "SHORT": self._graph.tier_size(Tier.SHORT),
+                    "MEDIUM": self._graph.tier_size(Tier.MEDIUM),
+                    "LONG": self._graph.tier_size(Tier.LONG),
+                },
+                "index_sizes": {
+                    "SHORT": self._index.size(Tier.SHORT),
+                    "MEDIUM": self._index.size(Tier.MEDIUM),
+                    "LONG": self._index.size(Tier.LONG),
+                },
+                "last_sleep_end": self._last_sleep_end,
+            }
+
+    async def status_async(self) -> dict:
+        """Async wrapper for status using a worker thread."""
+        return await asyncio.to_thread(self.status)
