@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyo
+*.pyd
+.env
+.env.*
+!.env.example
+# Do NOT ignore pyproject.toml

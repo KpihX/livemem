@@ -1,0 +1,35 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[project]
+name = "livemem"
+version = "0.1.0"
+description = "Brain-inspired living graph memory: 3 tiers, HNSW ANN, sleep consolidation, multimodal refs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "hnswlib>=0.8",
+    "fastembed>=0.4",
+    "sortedcontainers>=2.4",
+    "typer[all]>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+livemem = "livemem.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["livemem"]
