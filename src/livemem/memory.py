@@ -623,15 +623,20 @@ class LiveMem:
         3. High-importance sweep: query MEDIUM and LONG for k//2 each,
            filtered to importance ≥ importance_medium_floor. This ensures
            semantically important memories are surfaced regardless of tier.
-        4. Merge + deduplicate seeds (max k), keep highest cos per node.
-        5. 1-hop graph expansion from top-5 seeds:
-           For each outgoing edge from seed: traversal_score[neighbour] +=
-               cos(q, seed.v) * edge.cos_sim * strength_effective(neighbour).
-        6. Compute final_score for all candidates (5 components).
-        7. Sort descending, take top-k (or top-reranker_k if reranker on).
-        7b.[reranker] Cross-encoder rerank → re-sort → take top-k.
-        8. Reinforce all top-k nodes.
-        9. Return list[RetrievalResult].
+        3b.Urgency sweep: query SHORT and MEDIUM for k//2 each, filtered to
+           u_eff ≥ theta_urgent. Guarantees that urgency-pinned nodes always
+           enter the candidate pool regardless of cosine similarity to q.
+        4. Limit seeds to k (cosine-ranked).
+        5. Urgency sweep: scan ALL nodes, collect ids with u_eff ≥ theta_urgent
+           into urgent_forced. These bypass the k-limit and are merged into
+           all_candidates unconditionally.
+        6. 1-hop graph expansion from top-5 seeds.
+        7. Build all_candidates = seeds ∪ traversal ∪ urgent_forced.
+        8. Compute final_score for all candidates (5 components).
+        9. Sort descending, take top-k (or top-reranker_k if reranker on).
+        9b.[reranker] Cross-encoder rerank → re-sort → take top-k.
+        10. Reinforce all top-k nodes.
+        11. Return list[RetrievalResult].
 
         WHY include high-importance nodes from all tiers:
             A highly important node may have aged into LONG but still
@@ -662,12 +667,33 @@ class LiveMem:
                 if node.importance >= self._cfg.importance_medium_floor:
                     seeds[nid] = max(seeds.get(nid, 0.0), cos)
 
-        # Limit seeds to k.
+        # Limit seeds to k (cosine-ranked). Urgency-pinned nodes are exempt —
+        # they are collected separately below so they are never trimmed out.
         if len(seeds) > k:
             top_seeds = sorted(seeds.items(), key=lambda x: x[1], reverse=True)[:k]
             seeds = dict(top_seeds)
 
-        # ── 3. 1-hop graph traversal from top-5 seeds ────────────────────────
+        # ── 3. Urgency sweep — direct graph scan, bypasses seed limit ─────────
+        # WHY direct graph scan (not ANN):
+        #     ANN query ranks by cosine similarity. An urgent node may be
+        #     semantically unrelated to q — it would never appear in the top-k
+        #     cosine results. Routing urgency through ANN would silently miss it.
+        #     Direct scan is O(N_urgent) not O(N): urgency decays fast
+        #     (urgency_lambda=5e-5 → half-life ~4h), so very few nodes satisfy
+        #     u_eff ≥ theta_urgent at any time. The scan cost is negligible.
+        #     WHY bypass the seed limit:
+        #     The seed pool is capped at k (cosine-ranked) above. If we added
+        #     urgent nodes to seeds before trimming, a low-cosine urgent node
+        #     would be dropped. Instead we collect them into `urgent_forced`
+        #     which is merged into all_candidates unconditionally — guaranteeing
+        #     every urgency-pinned node always enters the scoring stage.
+        urgent_forced: set[str] = set()
+        for node in self._graph.V.values():
+            u_eff = urgency_effective(node, now, self._cfg)
+            if u_eff >= self._cfg.theta_urgent:
+                urgent_forced.add(node.id)
+
+        # ── 4. 1-hop graph traversal from top-5 seeds ────────────────────────
         traversal: dict[str, float] = {}
         top5 = sorted(seeds.items(), key=lambda x: x[1], reverse=True)[:5]
         for seed_id, seed_cos in top5:
@@ -683,8 +709,9 @@ class LiveMem:
                 )
                 traversal[nb_id] = traversal.get(nb_id, 0.0) + score_contrib
 
-        # ── 4. Build candidate pool (seeds + traversal nodes) ────────────────
-        all_candidates: set[str] = set(seeds.keys()) | set(traversal.keys())
+        # ── 5. Build candidate pool (seeds + traversal + urgent_forced) ─────────
+        # urgent_forced nodes bypass the seed cosine-rank filter (step 3 above).
+        all_candidates: set[str] = set(seeds.keys()) | set(traversal.keys()) | urgent_forced
 
         # ── 5. Score all candidates (5-component formula) ─────────────────────
         scored: list[tuple[float, str]] = []
