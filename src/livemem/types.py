@@ -233,6 +233,11 @@ class Edge:
                 f"Edge({self.from_id[:8]}→{self.to_id[:8]}): "
                 f"delta_t must be ≥ 0, got {self.delta_t:.3f}"
             )
+        # Clamp before validation — HNSW dot products on unit vectors can
+        # yield 1.0 + tiny epsilon due to float32 rounding.  Silently
+        # clip rather than crash: any value outside (-eps, 1+eps) is still
+        # a bug and surfaces as a negative score downstream.
+        self.cos_sim = max(0.0, min(1.0, self.cos_sim))
         if not (0.0 <= self.cos_sim <= 1.0):
             raise ValueError(
                 f"Edge: cos_sim must be in [0,1], got {self.cos_sim:.4f}"
