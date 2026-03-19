@@ -1,0 +1,61 @@
+embedding:
+  primary:
+    implementation: "fastembed_text"
+    dimension: 384
+    model_name: "BAAI/bge-small-en-v1.5"
+  reranker:
+    enabled: false
+    implementation: "fastembed_cross_encoder"
+    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    candidate_pool: 20
+
+tiers:
+  short_term_seconds: 86400.0
+  medium_term_seconds: 604800.0
+  alpha_strength: 0.8
+  beta_importance: 0.3
+
+neighbors:
+  awake: 10
+  sleep: 20
+  promote: 15
+
+edges:
+  min_similarity: 0.60
+  sleep_similarity: 0.75
+  promote_similarity: 0.70
+  compression_similarity: 0.90
+
+urgency:
+  decay_lambda: 5.0e-5
+  pin_threshold: 0.7
+  importance_medium_floor: 0.6
+
+retention:
+  decay_lambda: 5.0e-6
+  reinforce_delta: 0.10
+  initial_strength: 0.5
+
+daemon:
+  long_diffusion_idle_seconds: 1800.0
+  idle_ttl_seconds: 300.0
+  check_interval_seconds: 30.0
+
+compression:
+  max_nodes: 10000
+  long_term_fraction: 0.7
+
+retrieval:
+  weights:
+    direct_cosine: 0.45
+    graph_traversal: 0.20
+    effective_strength: 0.15
+    importance: 0.12
+    urgency: 0.08
+
+index:
+  hnsw:
+    max_elements: 50000
+    ef_construction: 200
+    m: 16
+    ef_search: 50

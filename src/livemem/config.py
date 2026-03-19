@@ -1,257 +1,261 @@
 """
-config.py — LiveMem configuration dataclass.
+config.py — structured configuration loader backed by config.yaml.
 
-WHY this file exists:
-    All tunable parameters live here as a single frozen dataclass so that
-    every module receives the same immutable configuration object. No magic
-    global variables, no scattered constants. The caller can override any
-    parameter by constructing a new LiveConfig; the DEFAULT_CONFIG singleton
-    is used by helper functions that accept an optional cfg argument.
-
-    Parameters are grouped by concern: embedding, tier boundaries, ANN
-    search, edge thresholds, decay/reinforce, daemon timing, and retrieval
-    scoring weights.
+WHY this module exists:
+    The source of truth for livemem configuration should be external to the
+    Python code so the system can swap implementations and tune behavior
+    without editing module constants. config.yaml holds the structured config;
+    LiveConfig loads it into a strongly typed runtime object and exposes
+    `get("section.subsection.key")` for ergonomic read access.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must load to a mapping: {path}")
+    return data
+
+
+def _lookup(data: dict[str, Any], path: str) -> Any:
+    current: Any = data
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(path)
+        current = current[part]
+    return current
 
 
 @dataclass(frozen=True)
 class LiveConfig:
-    """Immutable configuration for the LiveMem system.
+    """Immutable runtime config with structured lookup support."""
 
-    Every field is documented with WHY it exists (not just what it is).
-    Frozen = safe to pass around and use as dict keys if needed.
-    """
-
-    # ── Embedding ────────────────────────────────────────────────────────────
     d: int = 384
-    """Dimensionality of the embedding vector.
-    WHY: must match the chosen fastembed model output size.
-    BAAI/bge-small-en-v1.5 produces 384-dim vectors — change together."""
-
     model_name: str = "BAAI/bge-small-en-v1.5"
-    """fastembed model identifier used by RealEmbedder.
-    WHY: bge-small is a good trade-off between quality (~0.87 BEIR avg)
-    and speed (<50ms per query on CPU). To upgrade quality:
-      → bge-base-en-v1.5  (768d, ~0.90 BEIR): LiveConfig(model_name="BAAI/bge-base-en-v1.5", d=768)
-      → bge-large-en-v1.5 (1024d, ~0.92 BEIR): LiveConfig(model_name="BAAI/bge-large-en-v1.5", d=1024)
-    IMPORTANT: d MUST be updated to match the model's output dimension."""
-
-    # ── Tier boundaries ───────────────────────────────────────────────────────
-    T1: float = 86_400.0
-    """Effective-age threshold (seconds) below which a node stays SHORT.
-    WHY: mirrors human working memory (~24 h before things fade to
-    mid-term storage). Effective age is slower than wall-clock time for
-    strong/important nodes (see alpha_tier / beta_tier)."""
-
-    T2: float = 604_800.0
-    """Effective-age threshold (seconds) below which a node stays MEDIUM.
-    WHY: mirrors consolidation into episodic memory (~7 days for human
-    hippocampal replay). Beyond this the node becomes LONG (semantic)."""
-
-    alpha_tier: float = 0.8
-    """Weight of effective strength on effective-age denominator.
-    WHY: a high-strength node ages more slowly — it stays accessible
-    longer, like a well-rehearsed memory. Range [0, 1]."""
-
-    beta_tier: float = 0.3
-    """Weight of importance [0,1] on effective-age denominator.
-    WHY: highly important nodes resist tier demotion because they carry
-    higher semantic value, independent of access frequency."""
-
-    # ── ANN neighbor counts ───────────────────────────────────────────────────
-    k_awake: int = 10
-    """Number of ANN neighbors to query during awake ingestion.
-    WHY: edges formed at ingest time establish the initial associative
-    web. 10 is enough to wire new nodes into the local cluster without
-    creating excessive edge density."""
-
-    k_sleep: int = 20
-    """Number of ANN neighbors queried per tier during sleep diffusion.
-    WHY: sleep is less time-critical; a wider sweep finds more distant
-    associations that would be missed at ingest speed."""
-
-    k_promote: int = 15
-    """Number of ANN neighbors queried during sleep promotion pass.
-    WHY: promotion pulls relevant LONG/MEDIUM nodes back toward SHORT,
-    simulating memory recall during sleep. 15 balances coverage vs cost."""
-
-    # ── Edge cosine thresholds ────────────────────────────────────────────────
-    theta_min: float = 0.60
-    """Minimum cosine similarity to form any edge (AWAKE or reconnect).
-    WHY: below 0.60 two concepts are probably unrelated — edges would add
-    noise and slow graph traversal without semantic benefit."""
-
-    theta_sleep: float = 0.75
-    """Minimum cosine for SLEEP-type edges (diffusion pass).
-    WHY: sleep edges cross tier boundaries and must be higher-confidence
-    to avoid polluting LONG memory with spurious short-term associations."""
-
-    theta_promote: float = 0.70
-    """Minimum cosine for promotion edges (LONG→MEDIUM reinforce path).
-    WHY: slightly looser than theta_sleep because promotion is directional
-    (evoked centroid → long node) and the centroid already filters noise."""
-
-    theta_compress: float = 0.90
-    """Minimum cosine for merging two LONG nodes during compression.
-    WHY: compression is destructive (original nodes are removed). Only
-    very similar nodes (≥0.90 cos) should be fused to avoid losing
-    semantically distinct memories."""
-
-    # ── Urgency dynamics ──────────────────────────────────────────────────────
-    urgency_lambda: float = 5e-5
-    """Exponential decay rate for urgency (per second).
-    WHY: urgency decays 5× faster than strength — time-pressure is
-    ephemeral by nature. A node created 6 hours ago loses ~67% of its
-    urgency, matching how human deadline pressure fades quickly.
-    Decay starts at creation time (node.t), not last access."""
-
-    theta_urgent: float = 0.7
-    """Effective-urgency threshold above which a node is pinned to SHORT.
-    WHY: the Eisenhower urgent quadrant — a task with u_eff ≥ 0.7 must
-    stay in working memory regardless of its age or reinforcement history.
-    This implements the 'urgency pin' independently of importance."""
-
-    importance_medium_floor: float = 0.6
-    """Importance floor preventing demotion to LONG.
-    WHY: nodes with importance ≥ 0.6 are 'key' or above in the
-    Eisenhower importance axis. Burying them in LONG semantic storage
-    would make them inaccessible for contextual retrieval. The floor
-    allows them to age from SHORT → MEDIUM but never → LONG."""
-
-    # ── Forgetting / reinforcement ────────────────────────────────────────────
-    decay_lambda: float = 5e-6
-    """Ebbinghaus exponential decay rate (per second).
-    WHY: models natural forgetting. At λ=5e-6 the half-life of s_eff
-    is ~1.6 days — a fresh node stays above 50% strength for nearly
-    two days without reinforcement, then fades over the following week.
-    Previous value 1e-5 (half-life ~19h) was too aggressive for agent
-    memory: critical facts injected in the morning would be nearly gone
-    by evening without a retrieval event."""
-
-    delta_reinforce: float = 0.10
-    """Strength boost applied per reinforcement (retrieval or sleep link).
-    WHY: each access or sleep-association event adds 0.10 to effective
-    strength, mirroring the spacing-effect: repeated exposure
-    increases retention."""
-
-    # ── Daemon timing ─────────────────────────────────────────────────────────
-    tau_long: float = 1_800.0
-    """Idle duration (seconds) that enables SHORT→LONG diffusion during sleep.
-    WHY: 30 min of inactivity suggests the user is in a rest state. Only
-    then do we bridge the working memory (SHORT) to semantic storage (LONG),
-    avoiding premature consolidation during active sessions."""
-
-    idle_ttl: float = 300.0
-    """Idle time (seconds) before the daemon triggers a sleep phase.
-    WHY: 5 min without ingestion signals the end of an active session.
-    The daemon then runs consolidation in the background."""
-
-    daemon_check_interval: float = 30.0
-    """How often (seconds) the daemon polls for idle state.
-    WHY: frequent polling (e.g., 1 s) wastes CPU; 30 s is imperceptible
-    latency for a background process and keeps the event loop light."""
-
-    # ── Compression thresholds ────────────────────────────────────────────────
-    max_nodes: int = 10_000
-    """Hard ceiling on total live nodes before compression is triggered.
-    WHY: unbounded graph growth degrades ANN query speed and RAM usage.
-    10 k nodes @ 384-d float32 = ~15 MB for vectors alone — manageable."""
-
-    long_compress_fraction: float = 0.7
-    """Fraction of max_nodes that LONG tier must reach to trigger compress.
-    WHY: compression is triggered early (70% full) to avoid thrashing at
-    the hard ceiling. Only LONG nodes are compressed — SHORT/MEDIUM are
-    left intact to preserve recent context."""
-
-    # ── Retrieval scoring weights (must sum to 1.0) ───────────────────────────
-    alpha_score: float = 0.45
-    """Direct cosine similarity weight in retrieval score.
-    WHY: semantic distance to the query is the primary relevance signal,
-    so it gets the largest weight. Reduced from 0.50 to make room for
-    the urgency component (epsilon_score)."""
-
-    beta_score: float = 0.20
-    """Graph traversal score weight in retrieval score.
-    WHY: a node strongly connected to the top seed nodes is contextually
-    relevant even if its direct cosine is moderate. Reduced from 0.25
-    to make room for the urgency component."""
-
-    gamma_score: float = 0.15
-    """Effective strength weight in retrieval score.
-    WHY: frequently accessed, recently reinforced nodes should surface
-    higher — analogous to priming in cognitive science."""
-
-    delta_score: float = 0.12
-    """Importance [0,1] weight in retrieval score.
-    WHY: highly important nodes carry metadata-level relevance and should
-    rank higher than equally similar but low-importance nodes."""
-
-    epsilon_score: float = 0.08
-    """Urgency weight in retrieval score.
-    WHY: urgent nodes should surface in retrieval even when their cosine
-    similarity is moderate. An unread deadline note must not be buried.
-    Weight is smaller than importance to avoid overriding semantic signals."""
-
-    # ── Cross-encoder re-ranker (optional, off by default) ────────────────────
+    embedder_implementation: str = "fastembed_text"
     reranker_enabled: bool = False
-    """Enable cross-encoder re-ranking after HNSW candidate retrieval.
-    WHY off by default: each query requires O(reranker_k) cross-encoder
-    inference calls, adding ~50-200ms on CPU. Enable when precision
-    matters more than latency (complex multi-hop queries, final answer
-    generation). When disabled, retrieve() falls back to the 5-component
-    bi-encoder score, which is faster and sufficient for most use cases."""
-
     reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    """Cross-encoder model for CrossEncoderReranker.
-    WHY ms-marco-MiniLM-L-6-v2: industry-standard re-ranker trained on
-    MS MARCO passage ranking. ~10ms per pair on CPU (ONNX). BAAI also
-    offers bge-reranker-base (~30ms, higher NDCG) and bge-reranker-large
-    (~80ms, best quality). All are drop-in swaps via this field."""
-
+    reranker_implementation: str = "fastembed_cross_encoder"
     reranker_k: int = 20
-    """Number of bi-encoder HNSW candidates to pass to the cross-encoder.
-    WHY 20: provides a wide enough pool to recover the true top-k while
-    bounding cross-encoder cost at exactly reranker_k pairs per query.
-    Should be ≥ retrieve(k) — setting it equal to k degrades to no
-    reranking benefit."""
 
-    # ── Initialization ────────────────────────────────────────────────────────
+    T1: float = 86_400.0
+    T2: float = 604_800.0
+    alpha_tier: float = 0.8
+    beta_tier: float = 0.3
+
+    k_awake: int = 10
+    k_sleep: int = 20
+    k_promote: int = 15
+
+    theta_min: float = 0.60
+    theta_sleep: float = 0.75
+    theta_promote: float = 0.70
+    theta_compress: float = 0.90
+
+    urgency_lambda: float = 5e-5
+    theta_urgent: float = 0.7
+    importance_medium_floor: float = 0.6
+
+    decay_lambda: float = 5e-6
+    delta_reinforce: float = 0.10
     s_base_init: float = 0.5
-    """Floor strength for new nodes — used as the minimum s_base.
-    WHY: actual s_base at ingestion is lerp(s_base_init, 1.0, importance)
-    so a critical node (imp=1.0) starts at s_base=1.0, a trivial one
-    (imp=0.0) starts at s_base=s_base_init (0.5).  Keeping 0.5 as the
-    floor ensures even irrelevant nodes have enough initial strength to
-    form edges and be retrievable for at least one sleep cycle before
-    they drift to LONG."""
 
-    # ── HNSW index parameters ─────────────────────────────────────────────────
+    tau_long: float = 1_800.0
+    idle_ttl: float = 300.0
+    daemon_check_interval: float = 30.0
+
+    max_nodes: int = 10_000
+    long_compress_fraction: float = 0.7
+
+    alpha_score: float = 0.45
+    beta_score: float = 0.20
+    gamma_score: float = 0.15
+    delta_score: float = 0.12
+    epsilon_score: float = 0.08
+
     hnsw_max_elements: int = 50_000
-    """Maximum elements the HNSW index pre-allocates space for.
-    WHY: hnswlib requires a pre-allocated ceiling. 50 k >> max_nodes,
-    giving headroom without wasting memory."""
-
     hnsw_ef_construction: int = 200
-    """ef_construction for HNSW index build quality.
-    WHY: higher = better recall at the cost of longer add_items time.
-    200 is a standard sweet-spot for <1M vectors."""
-
     hnsw_M: int = 16
-    """M (number of bi-directional links) for HNSW graph.
-    WHY: M=16 gives ~0.99 recall@10 for 384-d cosine on typical NLP
-    datasets with minimal memory overhead (~64 bytes/node extra)."""
-
     hnsw_ef_search: int = 50
-    """ef_search for HNSW query-time accuracy/speed tradeoff.
-    WHY: ef=50 gives excellent recall (>0.99) for k≤20 queries on our
-    scale. Increase to 100+ if recall drops below threshold."""
+
+    config_path: str = ""
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        config_path: Path | None = None,
+        overrides: dict[str, Any] | None = None,
+    ) -> "LiveConfig":
+        """Build a typed config from the structured YAML mapping."""
+        flat = {
+            "d": int(_lookup(data, "embedding.primary.dimension")),
+            "model_name": str(_lookup(data, "embedding.primary.model_name")),
+            "embedder_implementation": str(
+                _lookup(data, "embedding.primary.implementation")
+            ),
+            "reranker_enabled": bool(_lookup(data, "embedding.reranker.enabled")),
+            "reranker_model_name": str(
+                _lookup(data, "embedding.reranker.model_name")
+            ),
+            "reranker_implementation": str(
+                _lookup(data, "embedding.reranker.implementation")
+            ),
+            "reranker_k": int(_lookup(data, "embedding.reranker.candidate_pool")),
+            "T1": float(_lookup(data, "tiers.short_term_seconds")),
+            "T2": float(_lookup(data, "tiers.medium_term_seconds")),
+            "alpha_tier": float(_lookup(data, "tiers.alpha_strength")),
+            "beta_tier": float(_lookup(data, "tiers.beta_importance")),
+            "k_awake": int(_lookup(data, "neighbors.awake")),
+            "k_sleep": int(_lookup(data, "neighbors.sleep")),
+            "k_promote": int(_lookup(data, "neighbors.promote")),
+            "theta_min": float(_lookup(data, "edges.min_similarity")),
+            "theta_sleep": float(_lookup(data, "edges.sleep_similarity")),
+            "theta_promote": float(_lookup(data, "edges.promote_similarity")),
+            "theta_compress": float(_lookup(data, "edges.compression_similarity")),
+            "urgency_lambda": float(_lookup(data, "urgency.decay_lambda")),
+            "theta_urgent": float(_lookup(data, "urgency.pin_threshold")),
+            "importance_medium_floor": float(
+                _lookup(data, "urgency.importance_medium_floor")
+            ),
+            "decay_lambda": float(_lookup(data, "retention.decay_lambda")),
+            "delta_reinforce": float(_lookup(data, "retention.reinforce_delta")),
+            "s_base_init": float(_lookup(data, "retention.initial_strength")),
+            "tau_long": float(_lookup(data, "daemon.long_diffusion_idle_seconds")),
+            "idle_ttl": float(_lookup(data, "daemon.idle_ttl_seconds")),
+            "daemon_check_interval": float(
+                _lookup(data, "daemon.check_interval_seconds")
+            ),
+            "max_nodes": int(_lookup(data, "compression.max_nodes")),
+            "long_compress_fraction": float(
+                _lookup(data, "compression.long_term_fraction")
+            ),
+            "alpha_score": float(_lookup(data, "retrieval.weights.direct_cosine")),
+            "beta_score": float(_lookup(data, "retrieval.weights.graph_traversal")),
+            "gamma_score": float(
+                _lookup(data, "retrieval.weights.effective_strength")
+            ),
+            "delta_score": float(_lookup(data, "retrieval.weights.importance")),
+            "epsilon_score": float(_lookup(data, "retrieval.weights.urgency")),
+            "hnsw_max_elements": int(_lookup(data, "index.hnsw.max_elements")),
+            "hnsw_ef_construction": int(
+                _lookup(data, "index.hnsw.ef_construction")
+            ),
+            "hnsw_M": int(_lookup(data, "index.hnsw.m")),
+            "hnsw_ef_search": int(_lookup(data, "index.hnsw.ef_search")),
+            "config_path": str(config_path) if config_path is not None else "",
+        }
+        if overrides:
+            flat.update(overrides)
+        return cls(**flat)
+
+    @classmethod
+    def from_yaml(
+        cls,
+        path: Path | str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> "LiveConfig":
+        resolved = (
+            Path(path).expanduser()
+            if path is not None
+            else Path(__file__).with_name("config.yaml")
+        )
+        return cls.from_dict(_read_yaml(resolved), config_path=resolved, overrides=overrides)
+
+    def get(self, path: str, default: Any | None = None) -> Any:
+        """Return a config value through dotted-path access."""
+        try:
+            return _lookup(self.to_nested_dict(), path)
+        except KeyError:
+            return default
+
+    def to_nested_dict(self) -> dict[str, Any]:
+        """Render the flat runtime object back to its structured YAML shape."""
+        return {
+            "embedding": {
+                "primary": {
+                    "implementation": self.embedder_implementation,
+                    "dimension": self.d,
+                    "model_name": self.model_name,
+                },
+                "reranker": {
+                    "enabled": self.reranker_enabled,
+                    "implementation": self.reranker_implementation,
+                    "model_name": self.reranker_model_name,
+                    "candidate_pool": self.reranker_k,
+                },
+            },
+            "tiers": {
+                "short_term_seconds": self.T1,
+                "medium_term_seconds": self.T2,
+                "alpha_strength": self.alpha_tier,
+                "beta_importance": self.beta_tier,
+            },
+            "neighbors": {
+                "awake": self.k_awake,
+                "sleep": self.k_sleep,
+                "promote": self.k_promote,
+            },
+            "edges": {
+                "min_similarity": self.theta_min,
+                "sleep_similarity": self.theta_sleep,
+                "promote_similarity": self.theta_promote,
+                "compression_similarity": self.theta_compress,
+            },
+            "urgency": {
+                "decay_lambda": self.urgency_lambda,
+                "pin_threshold": self.theta_urgent,
+                "importance_medium_floor": self.importance_medium_floor,
+            },
+            "retention": {
+                "decay_lambda": self.decay_lambda,
+                "reinforce_delta": self.delta_reinforce,
+                "initial_strength": self.s_base_init,
+            },
+            "daemon": {
+                "long_diffusion_idle_seconds": self.tau_long,
+                "idle_ttl_seconds": self.idle_ttl,
+                "check_interval_seconds": self.daemon_check_interval,
+            },
+            "compression": {
+                "max_nodes": self.max_nodes,
+                "long_term_fraction": self.long_compress_fraction,
+            },
+            "retrieval": {
+                "weights": {
+                    "direct_cosine": self.alpha_score,
+                    "graph_traversal": self.beta_score,
+                    "effective_strength": self.gamma_score,
+                    "importance": self.delta_score,
+                    "urgency": self.epsilon_score,
+                }
+            },
+            "index": {
+                "hnsw": {
+                    "max_elements": self.hnsw_max_elements,
+                    "ef_construction": self.hnsw_ef_construction,
+                    "m": self.hnsw_M,
+                    "ef_search": self.hnsw_ef_search,
+                }
+            },
+        }
 
 
-# Singleton used as default argument throughout the codebase.
-# WHY a module-level singleton: avoids allocating a new object on every
-# function call that uses the default config (Python default-arg semantics
-# evaluate once at definition time, so the same object is reused).
-DEFAULT_CONFIG: LiveConfig = LiveConfig()
+@lru_cache(maxsize=1)
+def load_default_config() -> LiveConfig:
+    """Load the package-default config once per process."""
+    return LiveConfig.from_yaml()
+
+
+DEFAULT_CONFIG: LiveConfig = load_default_config()

@@ -102,6 +102,12 @@ uv tool install --editable .
 uv run livemem --help
 ```
 
+Default configuration now lives in:
+
+```text
+src/livemem/config.yaml
+```
+
 ---
 
 ## CLI Commands
@@ -160,6 +166,10 @@ mem = LiveMem()
 
 # Or with mock embedder (no download, deterministic):
 mem = LiveMem(mock=True)
+
+# Read structured config through dotted paths:
+print(mem.cfg.get("embedding.primary.implementation"))
+print(mem.cfg.get("retrieval.weights.direct_cosine"))
 
 # Ingest
 node_id = mem.ingest_awake(
@@ -258,24 +268,35 @@ The API persists state to `~/.livemem/state.json` by default, exactly like the C
 
 ## Configuration Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `d` | 384 | Embedding dimension |
-| `model_name` | `BAAI/bge-small-en-v1.5` | fastembed model |
-| `T1` | 86400 (24h) | SHORT→MEDIUM boundary (seconds) |
-| `T2` | 604800 (7d) | MEDIUM→LONG boundary (seconds) |
-| `alpha_tier` | 0.8 | Strength influence on effective age |
-| `beta_tier` | 0.3 | Importance influence on effective age |
-| `k_awake` | 10 | ANN neighbours at ingest |
-| `k_sleep` | 20 | ANN neighbours during diffusion |
-| `theta_min` | 0.60 | Min cosine for any edge |
-| `theta_sleep` | 0.75 | Min cosine for SLEEP edges |
-| `theta_compress` | 0.90 | Min cosine for cluster fusion |
-| `decay_lambda` | 5e-6 | Ebbinghaus decay rate (per second) |
-| `delta_reinforce` | 0.10 | Strength boost per reinforcement |
-| `tau_long` | 1800 (30min) | Idle threshold for SHORT→LONG diffusion |
-| `idle_ttl` | 300 (5min) | Daemon sleep trigger threshold |
-| `max_nodes` | 10000 | Total node limit |
+`config.py` now loads a structured YAML file and exposes both:
+
+- typed runtime fields (`cfg.theta_min`, `cfg.k_awake`, ...)
+- dotted-path reads (`cfg.get("embedding.primary.model_name")`)
+
+Minimal shape:
+
+```yaml
+embedding:
+  primary:
+    implementation: fastembed_text
+    dimension: 384
+    model_name: BAAI/bge-small-en-v1.5
+  reranker:
+    enabled: false
+    implementation: fastembed_cross_encoder
+
+retrieval:
+  weights:
+    direct_cosine: 0.45
+    graph_traversal: 0.20
+```
+
+Embedder selection is now config-driven:
+
+```text
+embedding.primary.implementation = mock | fastembed_text
+embedding.reranker.implementation = fastembed_cross_encoder
+```
 
 ---
 
@@ -285,7 +306,7 @@ The API persists state to `~/.livemem/state.json` by default, exactly like the C
 uv run pytest tests/ -v --cov=livemem
 ```
 
-Test coverage: 10 test files, 157 tests covering types, graph, index, memory, retrieval, urgency sweep, sleep, persistence, daemon, and REST API.
+Test coverage: 11 test files, 161 tests covering config, types, graph, index, memory, retrieval, urgency sweep, sleep, persistence, daemon, and REST API.
 
 ---
 
@@ -295,11 +316,18 @@ Test coverage: 10 test files, 157 tests covering types, graph, index, memory, re
 src/livemem/
 ├── __init__.py      — public API exports
 ├── api.py           — FastAPI microservice surface
-├── config.py        — LiveConfig frozen dataclass
+├── config.py        — YAML-backed LiveConfig loader + dotted-path access
+├── config.yaml      — structured runtime configuration source of truth
 ├── types.py         — Node, Edge, Tier, strength_effective, urgency_effective, tier_fn
 ├── graph.py         — directed graph with tier-bucketed SortedLists
 ├── index.py         — hnswlib HNSW per-tier ANN index
-├── embedder.py      — MockEmbedder + RealEmbedder + CrossEncoderReranker
+├── embedder.py      — backward-compatible facade to embeddings/
+├── embeddings/
+│   ├── base.py      — BaseEmbedder + BaseReranker contracts
+│   ├── mock.py      — deterministic MockEmbedder
+│   ├── fastembed_text.py — fastembed text embedder implementation
+│   ├── fastembed_cross_encoder.py — fastembed cross-encoder reranker
+│   └── factory.py   — implementation selection from config
 ├── memory.py        — LiveMem orchestrator (ingest, sleep, retrieve, async wrappers)
 ├── daemon.py        — asyncio SleepDaemon
 ├── persistence.py   — JSON save/load

@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 
 from livemem.config import DEFAULT_CONFIG, LiveConfig
-from livemem.embedder import BaseEmbedder, make_embedder
+from livemem.embeddings.base import BaseEmbedder
 from livemem.graph import Graph
 from livemem.index import TieredIndex
 from livemem.memory import LiveMem

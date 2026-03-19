@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## [0.3.2] — 2026-03-19
+
+### Added
+- [x] `src/livemem/config.yaml`: structured external configuration source of truth for embeddings, tiers, retrieval, daemon, compression, and index settings
+- [x] `LiveConfig.from_yaml()` and `LiveConfig.get("a.b.c")`: YAML-backed config loading with dotted-path access
+- [x] `src/livemem/embeddings/`: dedicated embedding subsystem package split into `base.py`, `mock.py`, `fastembed_text.py`, `fastembed_cross_encoder.py`, and `factory.py`
+- [x] `tests/test_config.py`: config loading and implementation-selection coverage
+
+### Changed
+- [x] Embedder/reranker selection is now config-driven via `config.yaml` instead of being hardwired in one module
+- [x] `src/livemem/embedder.py` is now a thin compatibility facade instead of the primary implementation surface
+
 ## [0.3.1] — 2026-03-19
 
 ### Added

@@ -22,7 +22,6 @@ from rich.table import Table
 
 from livemem.api import create_app
 from livemem.config import DEFAULT_CONFIG, LiveConfig
-from livemem.embedder import make_embedder
 from livemem.memory import LiveMem
 from livemem.persistence import load, save
 from livemem.types import IngestInput, RefType, Tier

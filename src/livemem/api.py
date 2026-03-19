@@ -264,7 +264,7 @@ def create_app(
 
     app = FastAPI(
         title="LiveMem API",
-        version="0.3.1",
+        version="0.3.2",
         summary="Brain-inspired tiered graph memory microservice.",
         lifespan=lifespan,
     )

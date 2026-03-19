@@ -5,6 +5,7 @@
 - [ ] **Batch ingest file adapters**: CSV/JSONL/directory adapters on top of `ingest_awake_batch`
 - [ ] **Compression observability**: expose per-run cluster sizes and duration, not only cumulative stats
 - [ ] **Thread-safety stress tests**: concurrent ingest/retrieve/sleep smoke tests for the engine
+- [ ] **Config schema validation**: validate `config.yaml` structure and report precise path-level errors
 
 ## Future Work (long-term)
 

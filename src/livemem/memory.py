@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from livemem.config import DEFAULT_CONFIG, LiveConfig
-from livemem.embedder import BaseEmbedder, CrossEncoderReranker, make_embedder
+from livemem.embeddings import BaseEmbedder, BaseReranker, make_embedder, make_reranker
 from livemem.graph import Graph
 from livemem.index import TieredIndex
 from livemem.types import (
@@ -105,10 +105,7 @@ class LiveMem:
             "nodes_saved": 0,
             "last_run_at": 0.0,
         }
-        # Cross-encoder re-ranker — lazy-loaded on first retrieve() call
-        # when cfg.reranker_enabled is True. Always instantiated so the
-        # object is ready; model download is deferred until rerank().
-        self._reranker = CrossEncoderReranker(cfg)
+        self._reranker: BaseReranker = make_reranker(cfg)
 
     # ── Properties ─────────────────────────────────────────────────────────────
 
