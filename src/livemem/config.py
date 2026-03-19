@@ -34,8 +34,10 @@ class LiveConfig:
     model_name: str = "BAAI/bge-small-en-v1.5"
     """fastembed model identifier used by RealEmbedder.
     WHY: bge-small is a good trade-off between quality (~0.87 BEIR avg)
-    and speed (<50ms per query on CPU). Swap for bge-large for higher
-    accuracy at the cost of 4x more RAM and latency."""
+    and speed (<50ms per query on CPU). To upgrade quality:
+      → bge-base-en-v1.5  (768d, ~0.90 BEIR): LiveConfig(model_name="BAAI/bge-base-en-v1.5", d=768)
+      → bge-large-en-v1.5 (1024d, ~0.92 BEIR): LiveConfig(model_name="BAAI/bge-large-en-v1.5", d=1024)
+    IMPORTANT: d MUST be updated to match the model's output dimension."""
 
     # ── Tier boundaries ───────────────────────────────────────────────────────
     T1: float = 86_400.0
@@ -192,6 +194,29 @@ class LiveConfig:
     WHY: urgent nodes should surface in retrieval even when their cosine
     similarity is moderate. An unread deadline note must not be buried.
     Weight is smaller than importance to avoid overriding semantic signals."""
+
+    # ── Cross-encoder re-ranker (optional, off by default) ────────────────────
+    reranker_enabled: bool = False
+    """Enable cross-encoder re-ranking after HNSW candidate retrieval.
+    WHY off by default: each query requires O(reranker_k) cross-encoder
+    inference calls, adding ~50-200ms on CPU. Enable when precision
+    matters more than latency (complex multi-hop queries, final answer
+    generation). When disabled, retrieve() falls back to the 5-component
+    bi-encoder score, which is faster and sufficient for most use cases."""
+
+    reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    """Cross-encoder model for CrossEncoderReranker.
+    WHY ms-marco-MiniLM-L-6-v2: industry-standard re-ranker trained on
+    MS MARCO passage ranking. ~10ms per pair on CPU (ONNX). BAAI also
+    offers bge-reranker-base (~30ms, higher NDCG) and bge-reranker-large
+    (~80ms, best quality). All are drop-in swaps via this field."""
+
+    reranker_k: int = 20
+    """Number of bi-encoder HNSW candidates to pass to the cross-encoder.
+    WHY 20: provides a wide enough pool to recover the true top-k while
+    bounding cross-encoder cost at exactly reranker_k pairs per query.
+    Should be ≥ retrieve(k) — setting it equal to k degrades to no
+    reranking benefit."""
 
     # ── Initialization ────────────────────────────────────────────────────────
     s_base_init: float = 0.5

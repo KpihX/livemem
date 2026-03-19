@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from livemem.config import DEFAULT_CONFIG, LiveConfig
-from livemem.embedder import BaseEmbedder, make_embedder
+from livemem.embedder import BaseEmbedder, CrossEncoderReranker, make_embedder
 from livemem.graph import Graph
 from livemem.index import TieredIndex
 from livemem.types import (
@@ -93,6 +93,10 @@ class LiveMem:
         self._graph = Graph()
         self._index = TieredIndex(cfg)
         self._last_sleep_end: float = 0.0
+        # Cross-encoder re-ranker — lazy-loaded on first retrieve() call
+        # when cfg.reranker_enabled is True. Always instantiated so the
+        # object is ready; model download is deferred until rerank().
+        self._reranker = CrossEncoderReranker(cfg)
 
     # ── Properties ─────────────────────────────────────────────────────────────
 
@@ -607,6 +611,11 @@ class LiveMem:
         where traversal_score is accumulated by 1-hop graph expansion
         from the top-5 seed nodes (ANN hits + high-importance nodes).
 
+        When cfg.reranker_enabled is True, steps 6-8 change:
+            6b. Collect top-reranker_k candidates (instead of top-k).
+            7b. Cross-encoder re-ranks (query, summary) pairs → new scores.
+            8b. Sort by cross-encoder score, take top-k.
+
         Algorithm
         ---------
         1. q = embed(query_text).
@@ -619,7 +628,8 @@ class LiveMem:
            For each outgoing edge from seed: traversal_score[neighbour] +=
                cos(q, seed.v) * edge.cos_sim * strength_effective(neighbour).
         6. Compute final_score for all candidates (5 components).
-        7. Sort descending, take top-k.
+        7. Sort descending, take top-k (or top-reranker_k if reranker on).
+        7b.[reranker] Cross-encoder rerank → re-sort → take top-k.
         8. Reinforce all top-k nodes.
         9. Return list[RetrievalResult].
 
@@ -695,11 +705,35 @@ class LiveMem:
             )
             scored.append((final, nid))
 
-        # Sort descending, take top-k.
+        # Sort descending by 5-component score.
         scored.sort(reverse=True)
-        top_k = scored[:k]
 
-        # ── 6. Reinforce returned nodes ───────────────────────────────────────
+        # ── 6. Optional cross-encoder re-ranking ──────────────────────────────
+        if self._cfg.reranker_enabled:
+            # Expand the pool to reranker_k candidates, then re-rank them.
+            # WHY expand: the bi-encoder may rank the true best result at
+            # position 8 (just outside top-k). Feeding reranker_k > k into
+            # the cross-encoder lets it promote it to the top.
+            pool_size = max(k, self._cfg.reranker_k)
+            pool = scored[:pool_size]
+            # Build (node_id, summary) pairs for the cross-encoder.
+            ce_candidates: list[tuple[str, str]] = []
+            for _score, nid in pool:
+                if nid in self._graph:
+                    ce_candidates.append((nid, self._graph.V[nid].summary))
+            # Cross-encoder returns (ce_score, node_id) sorted descending.
+            reranked = self._reranker.rerank(query_text, ce_candidates)
+            # Rebuild top_k as (ce_score, node_id) for the final slice.
+            top_k: list[tuple[float, str]] = reranked[:k]
+            logger.debug(
+                "Cross-encoder reranked %d candidates → top-%d.",
+                len(ce_candidates),
+                k,
+            )
+        else:
+            top_k = scored[:k]
+
+        # ── 7. Reinforce returned nodes ───────────────────────────────────────
         results: list[RetrievalResult] = []
         for final_score, nid in top_k:
             if nid not in self._graph:

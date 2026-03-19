@@ -109,7 +109,15 @@ class RealEmbedder(BaseEmbedder):
         self._model: object | None = None  # Lazy-loaded TextEmbedding.
 
     def _get_model(self) -> object:
-        """Lazy-load the fastembed model on first call."""
+        """Lazy-load the fastembed model on first call.
+
+        WHY dimension check:
+            If the caller passes d=384 but model_name points to bge-base
+            (768d), every vector will be silently truncated or padded by
+            the HNSW index, producing garbage retrieval. We log a warning
+            so the mismatch surfaces immediately at first embed() call
+            rather than manifesting as mysterious low recall.
+        """
         if self._model is None:
             try:
                 from fastembed import TextEmbedding  # type: ignore[import]
@@ -120,7 +128,19 @@ class RealEmbedder(BaseEmbedder):
                 ) from exc
             logger.info("Loading fastembed model: %s", self._cfg.model_name)
             self._model = TextEmbedding(model_name=self._cfg.model_name)
-            logger.info("Model loaded.")
+            # Sanity-check: emit a probe vector and compare its length to cfg.d.
+            probe = list(self._model.embed(["probe"]))  # type: ignore[attr-defined]
+            actual_d = len(probe[0]) if probe else 0
+            if actual_d and actual_d != self._cfg.d:
+                logger.warning(
+                    "RealEmbedder: model '%s' outputs d=%d but cfg.d=%d. "
+                    "Vectors will be mis-sized — update LiveConfig(d=%d).",
+                    self._cfg.model_name,
+                    actual_d,
+                    self._cfg.d,
+                    actual_d,
+                )
+            logger.info("Model loaded (d=%d).", actual_d or self._cfg.d)
         return self._model
 
     def embed(self, text: str) -> np.ndarray:
@@ -158,6 +178,102 @@ class RealEmbedder(BaseEmbedder):
                 v /= norm
             result.append(v)
         return result
+
+
+class CrossEncoderReranker:
+    """Re-ranks bi-encoder HNSW candidates using a cross-encoder model.
+
+    WHY cross-encoder post-HNSW (the two-stage retrieval paradigm):
+        Bi-encoder HNSW is fast (O(log N) ANN lookup) but encodes query
+        and document independently — there is no token-level attention
+        between them. Cross-encoders jointly encode (query, document) pairs,
+        enabling full attention across both texts. This produces dramatically
+        more accurate relevance scores at the cost of O(reranker_k)
+        sequential inference calls per query.
+
+        Two-stage pipeline:
+          ┌──────────────────────────────────┐
+          │ HNSW bi-encoder                  │  fast, approximate
+          │ query vector → top-reranker_k    │  O(log N)
+          └──────────────┬───────────────────┘
+                         │ candidate (node_id, summary) pairs
+          ┌──────────────▼───────────────────┐
+          │ Cross-encoder re-ranker          │  precise, O(reranker_k)
+          │ (query, summary) → score per pair│
+          └──────────────┬───────────────────┘
+                         │ final top-k, true relevance order
+                         ▼
+
+    WHY lazy loading (same rationale as RealEmbedder):
+        Cross-encoder ONNX models are ~100-400 MB. Deferring the download
+        until the first rerank() call avoids blocking import-time.
+
+    Note: CrossEncoderReranker is stateless between calls — it only
+    carries the loaded model and its config. Thread-safety follows from
+    fastembed's ONNX session being read-only during inference.
+    """
+
+    def __init__(self, cfg: LiveConfig = DEFAULT_CONFIG) -> None:
+        self._cfg = cfg
+        self._model: object | None = None  # Lazy-loaded TextCrossEncoder.
+
+    def _get_model(self) -> object:
+        """Lazy-load the fastembed cross-encoder model on first call."""
+        if self._model is None:
+            try:
+                from fastembed import TextCrossEncoder  # type: ignore[import]
+            except ImportError as exc:
+                raise ImportError(
+                    "fastembed >= 0.3 with TextCrossEncoder is required for "
+                    "CrossEncoderReranker. Install with: pip install fastembed"
+                ) from exc
+            logger.info(
+                "Loading cross-encoder model: %s", self._cfg.reranker_model_name
+            )
+            self._model = TextCrossEncoder(
+                model_name=self._cfg.reranker_model_name
+            )
+            logger.info("Cross-encoder loaded.")
+        return self._model
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[str, str]],
+    ) -> list[tuple[float, str]]:
+        """Re-rank (node_id, summary) pairs for a query.
+
+        Parameters
+        ----------
+        query      : str — the retrieval query text (same as passed to embed).
+        candidates : list of (node_id, summary) — bi-encoder top candidates.
+
+        Returns
+        -------
+        list of (cross_encoder_score, node_id) sorted descending by score.
+
+        WHY use summary, not full content:
+            Nodes store a compact summary (≤200 chars) rather than raw
+            content. The cross-encoder re-ranks on this summary — which is
+            already a distilled semantic representation of the full content.
+            Using the full ref_uri content would require loading potentially
+            large blobs from disk on every retrieval, breaking latency.
+        """
+        if not candidates:
+            return []
+        model = self._get_model()
+        passages = [summary for _, summary in candidates]
+        node_ids = [nid for nid, _ in candidates]
+        # fastembed TextCrossEncoder.rerank() returns an iterable of floats.
+        raw_scores: list[float] = list(
+            model.rerank(query, passages)  # type: ignore[attr-defined]
+        )
+        ranked = sorted(
+            zip(raw_scores, node_ids),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        return list(ranked)
 
 
 def make_embedder(
