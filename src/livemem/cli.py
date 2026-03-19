@@ -22,7 +22,7 @@ from livemem.config import DEFAULT_CONFIG, LiveConfig
 from livemem.embedder import make_embedder
 from livemem.memory import LiveMem
 from livemem.persistence import load, save
-from livemem.types import Importance, RefType, Tier
+from livemem.types import RefType, Tier
 
 app = typer.Typer(
     name="livemem",
@@ -52,29 +52,50 @@ def _save_state(mem: LiveMem) -> None:
         console.print(f"[red]Error saving state: {exc}[/]")
 
 
-def _importance_from_str(s: str) -> Importance:
-    mapping = {
-        "weak": Importance.WEAK,
-        "normal": Importance.NORMAL,
-        "key": Importance.KEY,
-        "capital": Importance.CAPITAL,
-    }
-    return mapping.get(s.lower(), Importance.NORMAL)
-
-
 def _tier_name(tier: Tier) -> str:
     colours = {Tier.SHORT: "green", Tier.MEDIUM: "yellow", Tier.LONG: "red"}
     return f"[{colours[tier]}]{tier.name}[/]"
 
 
-def _importance_name(imp: Importance) -> str:
-    colours = {
-        Importance.WEAK: "dim",
-        Importance.NORMAL: "white",
-        Importance.KEY: "cyan",
-        Importance.CAPITAL: "bold magenta",
-    }
-    return f"[{colours[imp]}]{imp.name}[/]"
+def _importance_label(imp: float, cfg: LiveConfig) -> str:
+    """Colour-coded importance display — thresholds derived from LiveConfig.
+
+    WHY config-derived thresholds:
+        Hardcoding 0.85/0.6/0.35 would violate the 0-hardcoding principle.
+        The meaningful semantic boundary already in config is
+        importance_medium_floor (default 0.6 — the "key" boundary).
+        Other levels are derived arithmetically so they scale with any
+        user-configured floor:
+            critical = midpoint(floor, 1.0) = (floor + 1) / 2
+            normal   = midpoint(0.0, floor) = floor / 2
+    """
+    critical_floor = (cfg.importance_medium_floor + 1.0) / 2
+    normal_floor = cfg.importance_medium_floor / 2
+    if imp >= critical_floor:
+        return f"[bold magenta]{imp:.2f}[/] (critical)"
+    elif imp >= cfg.importance_medium_floor:
+        return f"[cyan]{imp:.2f}[/] (key)"
+    elif imp >= normal_floor:
+        return f"[white]{imp:.2f}[/] (normal)"
+    else:
+        return f"[dim]{imp:.2f}[/] (weak)"
+
+
+def _urgency_label(urg: float, cfg: LiveConfig) -> str:
+    """Colour-coded urgency display — thresholds derived from LiveConfig.
+
+    WHY config-derived thresholds:
+        The pin threshold theta_urgent (default 0.7) is the authoritative
+        "urgent" boundary. The "moderate" boundary is its midpoint so it
+        scales proportionally: moderate = theta_urgent / 2.
+    """
+    moderate_floor = cfg.theta_urgent / 2
+    if urg >= cfg.theta_urgent:
+        return f"[bold red]{urg:.2f}[/] (urgent)"
+    elif urg >= moderate_floor:
+        return f"[yellow]{urg:.2f}[/] (moderate)"
+    else:
+        return f"[dim]{urg:.2f}[/] (low)"
 
 
 # ── Commands ───────────────────────────────────────────────────────────────────
@@ -84,24 +105,26 @@ def ingest(
     text: str = typer.Argument(..., help="Summary text to ingest."),
     ref_uri: Optional[str] = typer.Option(None, "--ref-uri", help="URI to actual content."),
     ref_type: str = typer.Option("text", "--ref-type", help="Content type: text|image|audio|video|url"),
-    importance: str = typer.Option("normal", "--importance", help="weak|normal|key|capital"),
+    importance: float = typer.Option(0.5, "--importance", help="Semantic weight [0.0-1.0]. 0=negligible, 0.5=normal, 1.0=critical."),
+    urgency: float = typer.Option(0.0, "--urgency", help="Time-pressure [0.0-1.0]. Decays from creation time. ≥0.7 pins to SHORT."),
     mock: bool = typer.Option(False, "--mock", help="Use mock embedder (no model download)."),
 ) -> None:
     """Ingest a new memory unit (awake mode)."""
     mem = _load_or_new(mock)
-    imp = _importance_from_str(importance)
     node_id = mem.ingest_awake(
         summary=text,
         ref_uri=ref_uri,
         ref_type=ref_type if ref_type in RefType.ALL else "text",
-        importance=imp,
+        importance=max(0.0, min(1.0, importance)),
+        urgency=max(0.0, min(1.0, urgency)),
     )
     node = mem.graph.V[node_id]
     _save_state(mem)
     console.print(Panel(
         f"[bold]UUID:[/] {node_id}\n"
         f"[bold]Tier:[/] {_tier_name(node.tier)}\n"
-        f"[bold]Importance:[/] {_importance_name(node.importance)}\n"
+        f"[bold]Importance:[/] {_importance_label(node.importance, mem.cfg)}\n"
+        f"[bold]Urgency:[/] {_urgency_label(node.urgency, mem.cfg)}\n"
         f"[bold]Summary:[/] {node.summary[:80]}\n"
         f"[bold]Ref URI:[/] {node.ref_uri or '—'}\n"
         f"[bold]Ref Type:[/] {node.ref_type}",
@@ -129,7 +152,8 @@ def retrieve(
     table.add_column("#", style="dim", width=3)
     table.add_column("Score", width=8)
     table.add_column("Tier", width=8)
-    table.add_column("Importance", width=10)
+    table.add_column("Imp", width=6)
+    table.add_column("Urg", width=6)
     table.add_column("Summary", min_width=30, max_width=60)
     table.add_column("Ref URI", max_width=40)
 
@@ -138,7 +162,8 @@ def retrieve(
             str(i),
             f"{r.score:.4f}",
             _tier_name(r.tier),
-            _importance_name(r.importance),
+            f"{r.importance:.2f}",
+            f"{r.urgency:.2f}",
             r.summary[:60],
             r.ref_uri or "—",
         )
@@ -219,67 +244,68 @@ def demo(
     mem = LiveMem(cfg=DEFAULT_CONFIG, mock=mock)
 
     facts = [
-        # (summary, ref_uri, ref_type, importance)
+        # (summary, ref_uri, ref_type, importance, urgency)
         ("The Eiffel Tower was built in 1889 by Gustave Eiffel for the World's Fair.",
-         "https://en.wikipedia.org/wiki/Eiffel_Tower", "url", "normal"),
+         "https://en.wikipedia.org/wiki/Eiffel_Tower", "url", 0.5, 0.0),
         ("Neural networks learn by adjusting weights via backpropagation.",
-         "/docs/neural_nets.pdf", "text", "key"),
+         "/docs/neural_nets.pdf", "text", 0.7, 0.0),
         ("The HNSW algorithm enables sub-linear ANN search in high dimensions.",
-         "/papers/hnsw.pdf", "text", "key"),
+         "/papers/hnsw.pdf", "text", 0.7, 0.0),
         ("Photo of the Milky Way taken from Atacama Desert, Chile.",
-         "https://images.nasa.gov/milkyway.jpg", "image", "normal"),
+         "https://images.nasa.gov/milkyway.jpg", "image", 0.5, 0.0),
         ("Ebbinghaus forgetting curve: retention decays exponentially without rehearsal.",
-         "/docs/memory_science.md", "text", "capital"),
+         "/docs/memory_science.md", "text", 1.0, 0.0),
         ("Recording of bird songs from the Amazon rainforest.",
-         "/audio/amazon_birds.mp3", "audio", "normal"),
+         "/audio/amazon_birds.mp3", "audio", 0.5, 0.0),
         ("Python 3.11 introduced significant performance improvements via specialising adaptive interpreter.",
-         None, "text", "key"),
+         None, "text", 0.7, 0.0),
         ("Docker containers share the host OS kernel, unlike full VMs.",
-         "https://docs.docker.com/", "url", "normal"),
+         "https://docs.docker.com/", "url", 0.5, 0.0),
         ("Video lecture on transformer architecture by Andrej Karpathy.",
-         "https://youtube.com/karpathy_transformers", "video", "capital"),
+         "https://youtube.com/karpathy_transformers", "video", 1.0, 0.0),
         ("The cosine similarity of two unit vectors equals their dot product.",
-         None, "text", "key"),
+         None, "text", 0.7, 0.0),
         ("Claude Code is Anthropic's official CLI for agentic coding tasks.",
-         "https://claude.ai/code", "url", "normal"),
+         "https://claude.ai/code", "url", 0.5, 0.0),
         ("Traefik reverse proxy supports automatic TLS via ACME DNS-01 challenge.",
-         "/docs/traefik.md", "text", "normal"),
+         "/docs/traefik.md", "text", 0.5, 0.0),
         ("Portrait of Einstein writing equations on a chalkboard.",
-         "/images/einstein_chalkboard.png", "image", "normal"),
+         "/images/einstein_chalkboard.png", "image", 0.5, 0.0),
         ("The spacing effect: distributed practice outperforms massed practice for long-term retention.",
-         "/papers/spacing_effect.pdf", "text", "capital"),
+         "/papers/spacing_effect.pdf", "text", 1.0, 0.0),
         ("Tailscale creates a WireGuard mesh network across devices without port forwarding.",
-         "https://tailscale.com/", "url", "normal"),
+         "https://tailscale.com/", "url", 0.5, 0.0),
         ("NumPy vectorised operations are implemented in C and avoid Python overhead.",
-         None, "text", "key"),
+         None, "text", 0.7, 0.0),
         ("Podcast episode on cognitive architectures and working memory capacity.",
-         "/audio/cognitive_arch_podcast.mp3", "audio", "normal"),
+         "/audio/cognitive_arch_podcast.mp3", "audio", 0.5, 0.0),
         ("HNSW index: M=16 gives ~0.99 recall@10 on typical NLP embeddings.",
-         None, "text", "key"),
+         None, "text", 0.7, 0.0),
         ("Time-lapse video of the International Space Station crossing the night sky.",
-         "https://example.com/iss_timelapse.mp4", "video", "normal"),
+         "https://example.com/iss_timelapse.mp4", "video", 0.5, 0.0),
         ("Sortedcontainers SortedList gives O(log n) insert and O(1) iteration in Python.",
-         None, "text", "normal"),
+         None, "text", 0.5, 0.0),
         ("The hippocampus replays memories during sleep for consolidation into neocortex.",
-         "/papers/sleep_consolidation.pdf", "text", "capital"),
+         "/papers/sleep_consolidation.pdf", "text", 1.0, 0.0),
         ("FastEmbed uses ONNX Runtime for 3x faster CPU inference vs sentence-transformers.",
-         "https://qdrant.github.io/fastembed/", "url", "normal"),
+         "https://qdrant.github.io/fastembed/", "url", 0.5, 0.0),
         ("Architecture diagram of KpihX homelab with Proxmox, LXC, and Traefik.",
-         "/diagrams/homelab_arch.png", "image", "key"),
+         "/diagrams/homelab_arch.png", "image", 0.7, 0.0),
         ("Vaultwarden is a self-hosted Bitwarden-compatible password manager.",
-         None, "text", "normal"),
+         None, "text", 0.5, 0.0),
         ("The attention mechanism in transformers enables parallel sequence processing.",
-         None, "text", "key"),
+         None, "text", 0.7, 0.0),
     ]
 
     console.print(f"[cyan]Ingesting {len(facts)} facts...[/]")
     node_ids = []
-    for summary, ref_uri, ref_type, imp_str in facts:
+    for summary, ref_uri, ref_type, imp, urg in facts:
         nid = mem.ingest_awake(
             summary=summary,
             ref_uri=ref_uri,
             ref_type=ref_type,
-            importance=_importance_from_str(imp_str),
+            importance=imp,
+            urgency=urg,
         )
         node_ids.append(nid)
 
@@ -291,7 +317,8 @@ def demo(
     results = mem.retrieve("memory consolidation during sleep", k=5)
     for i, r in enumerate(results, 1):
         console.print(
-            f"  {i}. [{r.score:.3f}] [{r.tier.name}] [{r.importance.name}] "
+            f"  {i}. [{r.score:.3f}] [{r.tier.name}] "
+            f"[imp={r.importance:.2f} urg={r.urgency:.2f}] "
             f"{r.summary[:70]}"
         )
 

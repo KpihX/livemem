@@ -12,7 +12,7 @@ import pytest
 
 from livemem.config import LiveConfig
 from livemem.memory import LiveMem
-from livemem.types import EdgeType, Importance, Tier
+from livemem.types import EdgeType, Tier
 from tests.conftest import make_node
 
 
@@ -264,7 +264,7 @@ def test_compress_max_importance_preserved(small_config, mock_embedder):
         v = np.array([1.0] + [0.0] * (small_config.d - 1), dtype=np.float32)
         v[0] = 1.0 + 0.0001 * i
         v /= np.linalg.norm(v)
-        imp = Importance.KEY if i == 0 else Importance.NORMAL
+        imp = 0.7 if i == 0 else 0.5
         n = make_node(summary=f"imp node {i}", tier=Tier.LONG, seed=400 + i, d=small_config.d,
                       importance=imp)
         object.__setattr__(n, "v", v)
@@ -275,7 +275,7 @@ def test_compress_max_importance_preserved(small_config, mock_embedder):
     mem.sleep_compress()
     for n in mem.graph.V.values():
         if n.consolidated:
-            assert n.importance >= Importance.KEY
+            assert n.importance >= 0.7
 
 
 def test_compress_reconnects_external_neighbors(small_config, mock_embedder):

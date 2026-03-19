@@ -12,7 +12,7 @@ import pytest
 
 from livemem.memory import LiveMem
 from livemem.persistence import load, save
-from livemem.types import EdgeType, Importance, Tier
+from livemem.types import EdgeType, Tier
 
 
 @pytest.fixture
@@ -25,10 +25,10 @@ def populated_mem(small_config, mock_embedder) -> LiveMem:
     """A LiveMem with a few ingested nodes."""
     mem = LiveMem(cfg=small_config, embedder=mock_embedder)
     mem.ingest_awake("Python is great", ref_uri="/notes.txt", ref_type="text",
-                     importance=Importance.KEY)
+                     importance=0.7)
     mem.ingest_awake("HNSW enables fast ANN search", ref_uri="https://example.com", ref_type="url")
     mem.ingest_awake("Audio from the forest", ref_uri="/audio.mp3", ref_type="audio",
-                     importance=Importance.CAPITAL)
+                     importance=1.0, urgency=0.8)
     return mem
 
 
@@ -75,7 +75,18 @@ def test_save_load_preserves_importance(populated_mem, tmp_path_json, small_conf
     orig_map = {n.id: n.importance for n in populated_mem.graph.V.values()}
     for n in loaded.graph.V.values():
         if n.id in orig_map:
-            assert n.importance == orig_map[n.id]
+            # Float comparison with tolerance for JSON round-trip.
+            assert abs(n.importance - orig_map[n.id]) < 1e-5
+
+
+def test_save_load_preserves_urgency(populated_mem, tmp_path_json, small_config):
+    """Urgency should survive JSON round-trip."""
+    save(populated_mem, tmp_path_json)
+    loaded = load(tmp_path_json, cfg=small_config, mock=True)
+    orig_map = {n.id: n.urgency for n in populated_mem.graph.V.values()}
+    for n in loaded.graph.V.values():
+        if n.id in orig_map:
+            assert abs(n.urgency - orig_map[n.id]) < 1e-5
 
 
 def test_save_load_preserves_tier(populated_mem, tmp_path_json, small_config):

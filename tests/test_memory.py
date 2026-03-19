@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from livemem.config import LiveConfig
-from livemem.types import Importance, Tier
+from livemem.types import Tier
 from tests.conftest import make_node
 
 
@@ -99,8 +99,8 @@ def test_ingest_all_start_in_short(fresh_mem):
 
 
 def test_ingest_importance_stored(fresh_mem):
-    nid = fresh_mem.ingest_awake("Capital memory", importance=Importance.CAPITAL)
-    assert fresh_mem.graph.V[nid].importance == Importance.CAPITAL
+    nid = fresh_mem.ingest_awake("Capital memory", importance=1.0)
+    assert abs(fresh_mem.graph.V[nid].importance - 1.0) < 1e-6
 
 
 # ── retrieve ───────────────────────────────────────────────────────────────────
@@ -129,13 +129,13 @@ def test_retrieve_reinforces_returned_nodes(fresh_mem):
     assert node.t_accessed >= old_t_accessed
 
 
-def test_retrieve_capital_from_medium(small_config, mock_embedder):
-    """CAPITAL nodes in MEDIUM should appear in retrieve results."""
+def test_retrieve_high_importance_from_medium(small_config, mock_embedder):
+    """High-importance nodes in MEDIUM should appear in retrieve results."""
     from livemem.memory import LiveMem
     mem = LiveMem(cfg=small_config, embedder=mock_embedder)
 
-    # Ingest a CAPITAL node and manually move it to MEDIUM.
-    nid = mem.ingest_awake("critical capital memory", importance=Importance.CAPITAL)
+    # Ingest a high-importance node (>= importance_medium_floor=0.6) and move to MEDIUM.
+    nid = mem.ingest_awake("critical capital memory", importance=1.0)
     node = mem.graph.V[nid]
     # Force move to MEDIUM.
     mem.graph.update_tier_set(node, Tier.SHORT, Tier.MEDIUM)

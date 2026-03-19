@@ -17,7 +17,7 @@ import pytest
 from livemem.config import LiveConfig
 from livemem.embedder import MockEmbedder
 from livemem.memory import LiveMem
-from livemem.types import Importance, Node, Tier
+from livemem.types import Node, Tier
 
 
 @pytest.fixture
@@ -36,6 +36,7 @@ def small_config() -> LiveConfig:
         theta_compress = 0.95 : high threshold for compression tests.
         tau_long=5.0  : 5s idle threshold for SHORT→LONG diffusion.
         max_nodes=100 : small enough to test compression easily.
+        Scoring weights sum to 1.0: 0.45+0.20+0.15+0.12+0.08=1.00
     """
     return LiveConfig(
         d=16,
@@ -50,6 +51,9 @@ def small_config() -> LiveConfig:
         theta_sleep=0.01,
         theta_promote=0.01,
         theta_compress=0.95,
+        urgency_lambda=1e-5,
+        theta_urgent=0.7,
+        importance_medium_floor=0.6,
         decay_lambda=1e-5,
         delta_reinforce=0.10,
         tau_long=5.0,
@@ -57,10 +61,11 @@ def small_config() -> LiveConfig:
         daemon_check_interval=30.0,
         max_nodes=100,
         long_compress_fraction=0.7,
-        alpha_score=0.50,
-        beta_score=0.25,
+        alpha_score=0.45,
+        beta_score=0.20,
         gamma_score=0.15,
-        delta_score=0.10,
+        delta_score=0.12,
+        epsilon_score=0.08,
         s_base_init=0.5,
         hnsw_max_elements=1000,
         hnsw_ef_construction=50,
@@ -86,7 +91,8 @@ def make_node(
     ref_uri: str | None = None,
     ref_type: str = "text",
     d: int = 16,
-    importance: Importance = Importance.NORMAL,
+    importance: float = 0.5,
+    urgency: float = 0.0,
     s_base: float = 0.5,
     t_offset: float = 0.0,
     tier: Tier = Tier.SHORT,
@@ -96,15 +102,16 @@ def make_node(
 
     Parameters
     ----------
-    summary   : node summary text.
-    ref_uri   : optional URI.
-    ref_type  : content type.
-    d         : vector dimension.
-    importance: importance level.
-    s_base    : initial strength.
-    t_offset  : shift creation time by this many seconds (negative = older).
-    tier      : initial tier.
-    seed      : RNG seed for the vector (None = random).
+    summary    : node summary text.
+    ref_uri    : optional URI.
+    ref_type   : content type.
+    d          : vector dimension.
+    importance : importance ∈ [0, 1] — continuous (no enum).
+    urgency    : urgency ∈ [0, 1] — continuous.
+    s_base     : initial strength.
+    t_offset   : shift creation time by this many seconds (negative = older).
+    tier       : initial tier.
+    seed       : RNG seed for the vector (None = random).
     """
     rng = np.random.default_rng(seed if seed is not None else int(time.time() * 1e6) % 2**32)
     v = rng.standard_normal(d).astype(np.float32)
@@ -116,6 +123,7 @@ def make_node(
         ref_uri=ref_uri,
         ref_type=ref_type,
         importance=importance,
+        urgency=urgency,
         s_base=s_base,
         t=now,
         t_accessed=now,

@@ -39,7 +39,7 @@ from livemem.embedder import BaseEmbedder, make_embedder
 from livemem.graph import Graph
 from livemem.index import TieredIndex
 from livemem.memory import LiveMem
-from livemem.types import Edge, EdgeType, Importance, Node, Tier
+from livemem.types import Edge, EdgeType, Node, Tier
 
 _FORMAT_VERSION = "0.1.0"
 
@@ -57,7 +57,8 @@ def _node_to_dict(node: Node) -> dict:
         "summary": node.summary,
         "ref_uri": node.ref_uri,
         "ref_type": node.ref_type,
-        "importance": int(node.importance),
+        "importance": float(node.importance),
+        "urgency": float(node.urgency),
         "s_base": float(node.s_base),
         "t": float(node.t),
         "t_accessed": float(node.t_accessed),
@@ -88,7 +89,8 @@ def _node_from_dict(d: dict) -> Node:
         summary=d["summary"],
         ref_uri=d.get("ref_uri"),
         ref_type=d.get("ref_type", "text"),
-        importance=Importance(d["importance"]),
+        importance=float(d.get("importance", 0.5)),
+        urgency=float(d.get("urgency", 0.0)),
         s_base=float(d["s_base"]),
         t=float(d["t"]),
         t_accessed=float(d["t_accessed"]),

@@ -29,11 +29,11 @@ from livemem.index import TieredIndex
 from livemem.types import (
     Edge,
     EdgeType,
-    Importance,
     Node,
     RetrievalResult,
     Tier,
     strength_effective,
+    urgency_effective,
     tier_fn,
 )
 
@@ -123,7 +123,8 @@ class LiveMem:
         summary: str,
         ref_uri: str | None = None,
         ref_type: str = "text",
-        importance: Importance = Importance.NORMAL,
+        importance: float = 0.5,
+        urgency: float = 0.0,
     ) -> str:
         """Ingest a new memory unit during an active (awake) session.
 
@@ -144,10 +145,11 @@ class LiveMem:
 
         Parameters
         ----------
-        summary    : str  — short textual summary (≤ 200 chars recommended).
-        ref_uri    : str  — path or URL to actual content (None = inline).
-        ref_type   : str  — RefType constant.
-        importance : Importance — semantic weight.
+        summary    : str   — short textual summary (≤ 200 chars recommended).
+        ref_uri    : str   — path or URL to actual content (None = inline).
+        ref_type   : str   — RefType constant.
+        importance : float — semantic weight ∈ [0, 1].
+        urgency    : float — time-pressure ∈ [0, 1]. Decays from creation time.
 
         Returns
         -------
@@ -165,6 +167,7 @@ class LiveMem:
             ref_uri=ref_uri,
             ref_type=ref_type,
             importance=importance,
+            urgency=urgency,
             s_base=self._cfg.s_base_init,
             t=now,
             t_accessed=now,
@@ -329,8 +332,11 @@ class LiveMem:
             logger.debug("sleep_promote: empty evoked set, skipping")
             return
 
-        # Compute strength-weighted centroid.
-        centroid = self._compute_centroid(evoked, now)
+        # Compute strength+urgency-weighted centroid.
+        # WHY include_urgency=True: the promote centroid should lean toward
+        # topics the user was urgently focused on — pulling long-term memories
+        # related to pressing concerns back into SHORT/MEDIUM.
+        centroid = self._compute_centroid(evoked, now, include_urgency=True)
 
         # Helper to find the most similar evoked node to a candidate.
         def most_similar_evoked(candidate_v: np.ndarray) -> Node:
@@ -531,12 +537,17 @@ class LiveMem:
                 self._index.remove(mid, Tier.LONG)
 
             # Create consolidated node.
+            # WHY urgency=0.0: a fused/archived node is by definition not
+            # urgent — it represents a stable semantic memory, not a
+            # pending task. Urgency would have decayed to near-zero before
+            # compression runs (tau_long idle + sleep phase elapsed).
             fused = Node(
                 v=v_f,
                 summary=fused_summary,
                 ref_uri=None,
                 ref_type="text",
                 importance=max_importance,
+                urgency=0.0,
                 s_base=max_s_base,
                 t=t_oldest,
                 t_accessed=now,
@@ -580,34 +591,37 @@ class LiveMem:
     ) -> list[RetrievalResult]:
         """Retrieve the top-k most relevant memory nodes for a query.
 
-        Scoring formula (per node n):
-            score(n) = alpha * cos(q, n.v)
-                     + beta  * traversal_score.get(n.id, 0)
-                     + gamma * strength_effective(n, now)
-                     + delta * (importance / 3)
+        Scoring formula (per node n, weights sum to 1.0):
+            score(n) = alpha   * cos(q, n.v)
+                     + beta    * traversal_score.get(n.id, 0)
+                     + gamma   * strength_effective(n, now)
+                     + delta   * n.importance          # already ∈ [0,1]
+                     + epsilon * urgency_effective(n, now)
 
         where traversal_score is accumulated by 1-hop graph expansion
-        from the top-5 seed nodes (ANN hits + CAPITAL nodes).
+        from the top-5 seed nodes (ANN hits + high-importance nodes).
 
         Algorithm
         ---------
         1. q = embed(query_text).
         2. direct = query SHORT index for k neighbours.
-        3. CAPITAL sweep: query MEDIUM and LONG for k//2 each,
-           filtered to importance == CAPITAL.
+        3. High-importance sweep: query MEDIUM and LONG for k//2 each,
+           filtered to importance ≥ importance_medium_floor. This ensures
+           semantically important memories are surfaced regardless of tier.
         4. Merge + deduplicate seeds (max k), keep highest cos per node.
         5. 1-hop graph expansion from top-5 seeds:
            For each outgoing edge from seed: traversal_score[neighbour] +=
                cos(q, seed.v) * edge.cos_sim * strength_effective(neighbour).
-        6. Compute final_score for all candidates.
+        6. Compute final_score for all candidates (5 components).
         7. Sort descending, take top-k.
         8. Reinforce all top-k nodes.
         9. Return list[RetrievalResult].
 
-        WHY include CAPITAL nodes from all tiers:
-            A CAPITAL node may have aged into LONG but still represents a
-            critical memory (e.g., a user's name or a key architectural
-            decision). We always surface it regardless of tier.
+        WHY include high-importance nodes from all tiers:
+            A highly important node may have aged into LONG but still
+            represents a critical memory. We always surface it regardless
+            of tier, ensuring the Eisenhower "important" quadrant is
+            never permanently buried.
         """
         now = time.time()
         if self._graph.total_nodes() == 0:
@@ -622,14 +636,14 @@ class LiveMem:
             if nid in self._graph:
                 seeds[nid] = max(seeds.get(nid, 0.0), cos)
 
-        # ── 2. CAPITAL sweep across MEDIUM and LONG ──────────────────────────
-        k_cap = max(1, k // 2)
+        # ── 2. High-importance sweep across MEDIUM and LONG ──────────────────
+        k_imp = max(1, k // 2)
         for tier in (Tier.MEDIUM, Tier.LONG):
-            for nid, cos in self._index.query(tier, q, k_cap):
+            for nid, cos in self._index.query(tier, q, k_imp):
                 if nid not in self._graph:
                     continue
                 node = self._graph.V[nid]
-                if node.importance == Importance.CAPITAL:
+                if node.importance >= self._cfg.importance_medium_floor:
                     seeds[nid] = max(seeds.get(nid, 0.0), cos)
 
         # Limit seeds to k.
@@ -656,7 +670,7 @@ class LiveMem:
         # ── 4. Build candidate pool (seeds + traversal nodes) ────────────────
         all_candidates: set[str] = set(seeds.keys()) | set(traversal.keys())
 
-        # ── 5. Score all candidates ───────────────────────────────────────────
+        # ── 5. Score all candidates (5-component formula) ─────────────────────
         scored: list[tuple[float, str]] = []
         for nid in all_candidates:
             if nid not in self._graph:
@@ -664,13 +678,14 @@ class LiveMem:
             n = self._graph.V[nid]
             cos_direct = float(np.dot(q, n.v))
             s_eff = strength_effective(n, now, self._cfg)
+            u_eff = urgency_effective(n, now, self._cfg)
             trav = traversal.get(nid, 0.0)
-            imp_norm = float(n.importance) / 3.0
             final = (
                 self._cfg.alpha_score * cos_direct
                 + self._cfg.beta_score * trav
                 + self._cfg.gamma_score * s_eff
-                + self._cfg.delta_score * imp_norm
+                + self._cfg.delta_score * n.importance
+                + self._cfg.epsilon_score * u_eff
             )
             scored.append((final, nid))
 
@@ -695,6 +710,7 @@ class LiveMem:
                     ref_type=n.ref_type,
                     tier=n.tier,
                     importance=n.importance,
+                    urgency=n.urgency,
                     cos_direct=cos_direct,
                 )
             )
@@ -761,22 +777,51 @@ class LiveMem:
             self._update_tier(node)
 
     def _compute_centroid(
-        self, nodes: list[Node], t: float
+        self,
+        nodes: list[Node],
+        t: float,
+        include_urgency: bool = False,
     ) -> np.ndarray:
-        """Compute the strength-weighted centroid of a list of nodes.
+        """Compute the weighted centroid of a list of nodes.
 
         Weights are the effective strength of each node at time t.
+        When include_urgency=True, urgency_effective is added to the
+        weight so that urgent nodes pull the centroid more strongly.
         The result is L2-normalised.
 
         WHY weighted centroid:
             Stronger (more reinforced) nodes should dominate the centroid
             direction. A uniform average would give equal weight to a
             half-forgotten node and a recently reinforced one.
+
+        WHY include_urgency in sleep_promote:
+            During the promote pass we want the evoked centroid to lean
+            toward urgent memories that the user was focused on during the
+            awake session. A task with high urgency should influence which
+            long-term memories are pulled back to SHORT more than a
+            low-urgency node of equal strength.
+
+        Parameters
+        ----------
+        nodes          : list of Node objects to average.
+        t              : current unix timestamp.
+        include_urgency: if True, weight = s_eff + u_eff; else weight = s_eff.
         """
-        weights = np.array(
-            [strength_effective(n, t, self._cfg) for n in nodes],
-            dtype=np.float64,
-        )
+        if include_urgency:
+            weights = np.array(
+                [
+                    strength_effective(n, t, self._cfg)
+                    + urgency_effective(n, t, self._cfg)
+                    for n in nodes
+                ],
+                dtype=np.float64,
+            )
+        else:
+            weights = np.array(
+                [strength_effective(n, t, self._cfg) for n in nodes],
+                dtype=np.float64,
+            )
+
         total = weights.sum()
         if total < 1e-12:
             weights = np.ones(len(nodes), dtype=np.float64)

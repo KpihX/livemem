@@ -11,7 +11,7 @@ import pytest
 
 from livemem.config import LiveConfig
 from livemem.memory import LiveMem
-from livemem.types import Importance, Tier
+from livemem.types import Tier
 from tests.conftest import make_node
 
 
@@ -86,10 +86,10 @@ def test_graph_traversal_adds_score_to_neighbors(small_config, mock_embedder):
 
 # ── CAPITAL sweep ──────────────────────────────────────────────────────────────
 
-def test_capital_nodes_from_medium_appear(small_config, mock_embedder):
-    """CAPITAL nodes in MEDIUM should be surfaced by retrieve."""
+def test_high_importance_nodes_from_medium_appear(small_config, mock_embedder):
+    """High-importance nodes in MEDIUM should be surfaced by retrieve."""
     mem = LiveMem(cfg=small_config, embedder=mock_embedder)
-    cap_id = mem.ingest_awake("critical capital architecture decision", importance=Importance.CAPITAL)
+    cap_id = mem.ingest_awake("critical capital architecture decision", importance=1.0)
     node = mem.graph.V[cap_id]
     # Move to MEDIUM.
     mem.graph.update_tier_set(node, Tier.SHORT, Tier.MEDIUM)
@@ -100,10 +100,10 @@ def test_capital_nodes_from_medium_appear(small_config, mock_embedder):
     assert cap_id in [r.node_id for r in results]
 
 
-def test_capital_nodes_from_long_appear(small_config, mock_embedder):
-    """CAPITAL nodes in LONG should be surfaced by retrieve."""
+def test_high_importance_nodes_from_long_appear(small_config, mock_embedder):
+    """High-importance nodes in LONG should be surfaced by retrieve."""
     mem = LiveMem(cfg=small_config, embedder=mock_embedder)
-    cap_id = mem.ingest_awake("fundamental capital fact about memory", importance=Importance.CAPITAL)
+    cap_id = mem.ingest_awake("fundamental capital fact about memory", importance=1.0)
     node = mem.graph.V[cap_id]
     # Move to LONG.
     mem.graph.update_tier_set(node, Tier.SHORT, Tier.LONG)
@@ -127,24 +127,23 @@ def test_score_uses_all_components(small_config, mock_embedder):
 
 
 def test_score_importance_bonus(small_config, mock_embedder):
-    """A KEY node should score higher than an identical WEAK node."""
+    """A high-importance node should score higher than an identical low-importance node."""
     from livemem.embedder import MockEmbedder
     import uuid as _uuid
 
     mem = LiveMem(cfg=small_config, embedder=mock_embedder)
 
     # Create two nodes with the same vector but different importances.
-    v = MockEmbedder(small_config).embed("same vector text")
     key_node = make_node(
         summary="same vector text",
-        importance=Importance.KEY,
+        importance=0.7,  # "key" level
         tier=Tier.SHORT,
         d=small_config.d,
         seed=950,
     )
     weak_node = make_node(
         summary="same vector text",
-        importance=Importance.WEAK,
+        importance=0.0,  # "weak" level
         tier=Tier.SHORT,
         d=small_config.d,
         seed=950,

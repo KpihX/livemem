@@ -50,14 +50,14 @@ class LiveConfig:
     hippocampal replay). Beyond this the node becomes LONG (semantic)."""
 
     alpha_tier: float = 0.8
-    """Weight of normalized strength on effective-age denominator.
+    """Weight of effective strength on effective-age denominator.
     WHY: a high-strength node ages more slowly — it stays accessible
     longer, like a well-rehearsed memory. Range [0, 1]."""
 
     beta_tier: float = 0.3
-    """Weight of importance enum value on effective-age denominator.
-    WHY: CAPITAL / KEY nodes should resist tier demotion because they
-    carry higher semantic value, independent of access frequency."""
+    """Weight of importance [0,1] on effective-age denominator.
+    WHY: highly important nodes resist tier demotion because they carry
+    higher semantic value, independent of access frequency."""
 
     # ── ANN neighbor counts ───────────────────────────────────────────────────
     k_awake: int = 10
@@ -97,6 +97,27 @@ class LiveConfig:
     WHY: compression is destructive (original nodes are removed). Only
     very similar nodes (≥0.90 cos) should be fused to avoid losing
     semantically distinct memories."""
+
+    # ── Urgency dynamics ──────────────────────────────────────────────────────
+    urgency_lambda: float = 5e-5
+    """Exponential decay rate for urgency (per second).
+    WHY: urgency decays 5× faster than strength — time-pressure is
+    ephemeral by nature. A node created 6 hours ago loses ~67% of its
+    urgency, matching how human deadline pressure fades quickly.
+    Decay starts at creation time (node.t), not last access."""
+
+    theta_urgent: float = 0.7
+    """Effective-urgency threshold above which a node is pinned to SHORT.
+    WHY: the Eisenhower urgent quadrant — a task with u_eff ≥ 0.7 must
+    stay in working memory regardless of its age or reinforcement history.
+    This implements the 'urgency pin' independently of importance."""
+
+    importance_medium_floor: float = 0.6
+    """Importance floor preventing demotion to LONG.
+    WHY: nodes with importance ≥ 0.6 are 'key' or above in the
+    Eisenhower importance axis. Burying them in LONG semantic storage
+    would make them inaccessible for contextual retrieval. The floor
+    allows them to age from SHORT → MEDIUM but never → LONG."""
 
     # ── Forgetting / reinforcement ────────────────────────────────────────────
     decay_lambda: float = 1e-5
@@ -141,25 +162,33 @@ class LiveConfig:
     left intact to preserve recent context."""
 
     # ── Retrieval scoring weights (must sum to 1.0) ───────────────────────────
-    alpha_score: float = 0.50
+    alpha_score: float = 0.45
     """Direct cosine similarity weight in retrieval score.
     WHY: semantic distance to the query is the primary relevance signal,
-    so it gets the largest weight."""
+    so it gets the largest weight. Reduced from 0.50 to make room for
+    the urgency component (epsilon_score)."""
 
-    beta_score: float = 0.25
+    beta_score: float = 0.20
     """Graph traversal score weight in retrieval score.
     WHY: a node strongly connected to the top seed nodes is contextually
-    relevant even if its direct cosine is moderate."""
+    relevant even if its direct cosine is moderate. Reduced from 0.25
+    to make room for the urgency component."""
 
     gamma_score: float = 0.15
     """Effective strength weight in retrieval score.
     WHY: frequently accessed, recently reinforced nodes should surface
     higher — analogous to priming in cognitive science."""
 
-    delta_score: float = 0.10
-    """Importance weight in retrieval score.
-    WHY: CAPITAL / KEY nodes carry metadata-level importance and should
-    rank higher than equally similar but WEAK nodes."""
+    delta_score: float = 0.12
+    """Importance [0,1] weight in retrieval score.
+    WHY: highly important nodes carry metadata-level relevance and should
+    rank higher than equally similar but low-importance nodes."""
+
+    epsilon_score: float = 0.08
+    """Urgency weight in retrieval score.
+    WHY: urgent nodes should surface in retrieval even when their cosine
+    similarity is moderate. An unread deadline note must not be buried.
+    Weight is smaller than importance to avoid overriding semantic signals."""
 
     # ── Initialization ────────────────────────────────────────────────────────
     s_base_init: float = 0.5

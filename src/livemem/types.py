@@ -3,13 +3,18 @@ types.py — Core data types for the LiveMem system.
 
 WHY this file exists:
     Centralises all domain types so that every other module imports from
-    a single source of truth. Enums, dataclasses, and the two key
-    analytical functions (strength_effective, tier_fn) that depend only
-    on a Node and a config live here.
+    a single source of truth. Enums, dataclasses, and the three key
+    analytical functions (strength_effective, urgency_effective, tier_fn)
+    that depend only on a Node and a config live here.
 
     Keeping analytical functions close to the types they operate on avoids
     circular imports: graph.py and memory.py both import from types.py,
     not from each other.
+
+CONTINUITY PRINCIPLE:
+    importance and urgency are continuous floats in [0, 1] — NO discretization.
+    This enables smooth gradient-based behaviour, fine-grained tuning, and
+    avoids the cliff effects that come from hard enum boundaries.
 """
 from __future__ import annotations
 
@@ -29,18 +34,6 @@ from livemem.config import DEFAULT_CONFIG
 
 
 # ── Enumerations ───────────────────────────────────────────────────────────────
-
-class Importance(IntEnum):
-    """Semantic importance level of a memory node.
-
-    WHY IntEnum: allows arithmetic comparisons (CAPITAL > KEY) and
-    direct use as a numeric score in tier_fn / retrieval formulas.
-    """
-    WEAK = 0
-    NORMAL = 1
-    KEY = 2
-    CAPITAL = 3
-
 
 class Tier(IntEnum):
     """Memory tier a node currently inhabits.
@@ -105,6 +98,11 @@ class Node:
         network. This follows the pointer-based memory architecture used
         in modern vector databases.
 
+    CONTINUITY PRINCIPLE (importance & urgency):
+        Both are continuous floats in [0, 1] — no discretization.
+        This enables smooth gradient-based tier transitions and scoring
+        without the cliff effects of integer enums.
+
     Fields
     ------
     v           : Unit-norm embedding (shape (d,)). __post_init__
@@ -112,7 +110,11 @@ class Node:
     summary     : Textual abstract ≤200 chars for human-readable recall.
     ref_uri     : Path or URL to actual content (None if inline text).
     ref_type    : One of RefType constants.
-    importance  : Semantic weight (WEAK…CAPITAL).
+    importance  : Continuous semantic weight ∈ [0, 1].
+                  0 = negligible, 0.5 = normal, 1 = absolutely critical.
+    urgency     : Continuous time-pressure ∈ [0, 1].
+                  Decays from node.t (creation time) via urgency_lambda.
+                  0 = no urgency, 1 = extreme deadline pressure.
     s_base      : Base strength ∈ [0,1]. Decays via Ebbinghaus curve.
     t           : Unix timestamp of creation.
     t_accessed  : Unix timestamp of last access / reinforcement.
@@ -126,7 +128,8 @@ class Node:
     summary: str
     ref_uri: str | None = None
     ref_type: str = RefType.TEXT
-    importance: Importance = Importance.NORMAL
+    importance: float = 0.5
+    urgency: float = 0.0
     s_base: float = 0.5
     t: float = field(default_factory=time.time)
     t_accessed: float = field(default_factory=time.time)
@@ -137,11 +140,14 @@ class Node:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def __post_init__(self) -> None:
-        """Enforce unit-norm invariant on the embedding vector.
+        """Enforce invariants on the embedding vector, importance, and urgency.
 
         WHY: cosine similarity via dot product only equals true cosine
         when both vectors are unit-norm. Enforcing normalization here
         means every caller can safely use np.dot(a.v, b.v) as cos(a,b).
+
+        Clamping importance and urgency to [0, 1] guards against accidental
+        out-of-range values while preserving the continuity principle.
         """
         norm = float(np.linalg.norm(self.v))
         if norm < 1e-12:
@@ -159,6 +165,18 @@ class Node:
                 self, "s_base", max(0.0, min(1.0, self.s_base))
             )
 
+        # Clamp importance to [0, 1] — continuity principle.
+        if not (0.0 <= self.importance <= 1.0):
+            object.__setattr__(
+                self, "importance", max(0.0, min(1.0, self.importance))
+            )
+
+        # Clamp urgency to [0, 1] — continuity principle.
+        if not (0.0 <= self.urgency <= 1.0):
+            object.__setattr__(
+                self, "urgency", max(0.0, min(1.0, self.urgency))
+            )
+
     def __hash__(self) -> int:
         """Hash by id (UUID string) for use in sets / dict keys."""
         return hash(self.id)
@@ -172,7 +190,7 @@ class Node:
     def __repr__(self) -> str:
         return (
             f"Node(id={self.id[:8]}…, tier={self.tier.name}, "
-            f"importance={self.importance.name}, "
+            f"importance={self.importance:.2f}, urgency={self.urgency:.2f}, "
             f"s_base={self.s_base:.3f}, summary={self.summary[:40]!r})"
         )
 
@@ -237,7 +255,8 @@ class RetrievalResult:
     ref_uri: str | None
     ref_type: str
     tier: Tier
-    importance: Importance
+    importance: float
+    urgency: float
     cos_direct: float
 
 
@@ -278,32 +297,87 @@ def strength_effective(
     return node.s_base * exp(-cfg.decay_lambda * elapsed)
 
 
+def urgency_effective(
+    node: Node,
+    t: float,
+    cfg: LiveConfig = DEFAULT_CONFIG,
+) -> float:
+    """Compute the effective (decayed) urgency of a node at time t.
+
+    WHY decay from creation time (node.t), not last access (t_accessed):
+        Urgency models time-pressure from an external deadline, not from
+        how recently the memory was rehearsed. A task due tomorrow has
+        the same urgency whether you looked at it 5 minutes ago or not.
+        Using node.t prevents urgency from being inadvertently reset by
+        reinforcement, which would make urgent-old nodes immortal.
+
+    WHY faster decay (urgency_lambda >> decay_lambda):
+        Urgency is ephemeral by design — a node that was urgent 24 hours
+        ago is likely no longer a pressing concern. Strength, on the other
+        hand, models long-term memory retention which decays much slower.
+
+    Formula:
+        u_eff = urgency * exp(-urgency_lambda * max(0, t - t_creation))
+
+    Parameters
+    ----------
+    node : Node
+        The memory node to evaluate.
+    t    : float
+        Current unix timestamp (wall-clock "now").
+    cfg  : LiveConfig
+        Configuration; provides urgency_lambda.
+
+    Returns
+    -------
+    float
+        Effective urgency ∈ [0, node.urgency].
+    """
+    elapsed = max(0.0, t - node.t)
+    return node.urgency * exp(-cfg.urgency_lambda * elapsed)
+
+
 def tier_fn(
     node: Node,
     t: float,
     cfg: LiveConfig = DEFAULT_CONFIG,
 ) -> Tier:
-    """Compute the current tier of a node based on its effective age.
+    """Compute the current tier of a node using 4-quadrant Eisenhower logic.
+
+    WHY 4-quadrant (urgency × importance):
+        Inspired by the Eisenhower matrix, nodes are governed by two
+        independent axes: urgency (time-pressure, decays quickly) and
+        importance (semantic weight, stable). Together they define four
+        behavioural quadrants:
+
+        ┌──────────────────────┬────────────────────────────┐
+        │ HIGH urgency         │ HIGH urgency               │
+        │ LOW importance       │ HIGH importance            │
+        │ → pinned SHORT       │ → pinned SHORT             │
+        ├──────────────────────┼────────────────────────────┤
+        │ LOW urgency          │ LOW urgency                │
+        │ LOW importance       │ HIGH importance            │
+        │ → raw tier (ages)    │ → floor at MEDIUM, no LONG │
+        └──────────────────────┴────────────────────────────┘
+
+    Algorithm (priority order):
+        1. Compute u_eff = urgency_effective(node, t, cfg).
+           If u_eff ≥ cfg.theta_urgent → return SHORT (urgency pin).
+        2. Compute s_eff = strength_effective(node, t, cfg).
+           denominator = 1 + alpha_tier * s_eff + beta_tier * importance
+           effective_age = (t - node.t) / max(denominator, 1e-9)
+        3. Raw tier from effective_age:
+           ea < T1 → SHORT; ea < T2 → MEDIUM; else → LONG
+        4. Importance floor: if raw == LONG and importance ≥
+           importance_medium_floor → return MEDIUM.
+        5. Return raw tier.
 
     WHY effective age (not raw age):
         Raw wall-clock age would demote frequently-accessed or highly
         important nodes too quickly. The denominator scales down the
         effective age proportionally to the node's strength and
-        importance, meaning a CAPITAL node that is regularly reinforced
-        stays in SHORT even days after creation — matching how human
-        working memory retains salient, rehearsed information.
-
-    Formula:
-        s_eff = strength_effective(node, t, cfg)
-        denominator = 1 + alpha_tier * s_eff + beta_tier * importance_value
-        effective_age = (t - t_creation) / denominator
-        → SHORT   if effective_age < T1
-        → MEDIUM  if effective_age < T2
-        → LONG    otherwise
-
-    CAPITAL floor:
-        CAPITAL nodes are NEVER demoted to LONG. They may reach MEDIUM
-        at most, preventing permanent burial of critical memories.
+        importance, meaning a high-importance node that is regularly
+        reinforced stays in SHORT even days after creation.
 
     Parameters
     ----------
@@ -315,20 +389,31 @@ def tier_fn(
     -------
     Tier
     """
+    # ── 1. Urgency pin: HIGH urgency → always SHORT ──────────────────────────
+    u_eff = urgency_effective(node, t, cfg)
+    if u_eff >= cfg.theta_urgent:
+        return Tier.SHORT
+
+    # ── 2. Effective-age computation ─────────────────────────────────────────
     s_eff = strength_effective(node, t, cfg)
-    denominator = (
+    denominator = max(
         1.0
         + cfg.alpha_tier * s_eff
-        + cfg.beta_tier * float(node.importance)
+        + cfg.beta_tier * node.importance,
+        1e-9,
     )
     effective_age = (t - node.t) / denominator
 
+    # ── 3. Raw tier from effective age ────────────────────────────────────────
     if effective_age < cfg.T1:
-        return Tier.SHORT
+        raw = Tier.SHORT
     elif effective_age < cfg.T2:
-        return Tier.MEDIUM
+        raw = Tier.MEDIUM
     else:
-        # CAPITAL floor: never demote CAPITAL nodes to LONG.
-        if node.importance == Importance.CAPITAL:
-            return Tier.MEDIUM
-        return Tier.LONG
+        raw = Tier.LONG
+
+    # ── 4. Importance floor: HIGH importance → never LONG ────────────────────
+    if raw == Tier.LONG and node.importance >= cfg.importance_medium_floor:
+        return Tier.MEDIUM
+
+    return raw
