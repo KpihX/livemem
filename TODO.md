@@ -1,6 +1,14 @@
 # TODO
 
-## Future Work
+## v0.3.0 Candidates (short-term)
+
+- [ ] **Proper test suite**: migrate 12 mini-tests to `src/livemem/tests/` with pytest + fixtures
+- [ ] **Async ingest_awake**: non-blocking version using asyncio.to_thread (needed for REST API)
+- [ ] **REST API**: FastAPI server exposing ingest/retrieve/sleep/status endpoints
+- [ ] **Compression stats**: track cluster sizes, fused counts, and savings in `status()` output
+- [ ] **Batch ingest**: `ingest_awake_batch` for efficient multi-document ingestion
+
+## Future Work (long-term)
 
 - [ ] **REST API**: FastAPI server exposing ingest/retrieve/sleep/status endpoints
 - [ ] **pgvector backend**: replace in-memory hnswlib with persistent pgvector index for multi-process access
